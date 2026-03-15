@@ -39,10 +39,11 @@ document.addEventListener("DOMContentLoaded", function() {
     let currentAudio         = null;
     let audioResponseReceived = false;
     let checkInTimer          = null;  // independent silence check-in timer
+    let vadReady              = false; // true once AudioContext has had time to warm up
     const CHECK_IN_MS         = 10000; // ms of silence before "are you still there?"
 
     // VAD tuning
-    const SILENCE_THRESHOLD   = 20;   // raised from 8 — filters out background hiss/noise
+    const SILENCE_THRESHOLD   = 15;   // 15/255 — filters noise while catching normal speech
     const SILENCE_DURATION_MS = 1800; // ms of continuous silence before submitting
     const MIN_SPEECH_CHUNKS   = 3;    // minimum 300ms of detected speech before submitting
     const MAX_RECORD_MS       = 12000; // hard cut-off — submit after 12 s no matter what
@@ -279,7 +280,7 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function checkVAD() {
-        if (!analyser || !isConversationActive) return;
+        if (!analyser || !isConversationActive || !vadReady) return;
 
         const buf = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteFrequencyData(buf);
@@ -408,13 +409,20 @@ document.addEventListener("DOMContentLoaded", function() {
         if (!ok) return;
 
         isConversationActive = true;
+        vadReady = false;
         setAgentState('listening');
         connectWebSocket();
-        resetCheckInTimer(); // start 10s silence clock immediately
+        // Delay check-in timer by 2s: covers WebSocket connection + AudioContext warmup
+        // so the user gets a full 10s window of actual working speech detection
+        setTimeout(() => {
+            vadReady = true;
+            resetCheckInTimer();
+        }, 2000);
     });
 
     stopButton.addEventListener('click', function() {
         isConversationActive = false;
+        vadReady = false;
         clearTimeout(checkInTimer);
         stopVAD();
         stopRecording();

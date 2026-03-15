@@ -30,10 +30,11 @@ document.addEventListener("DOMContentLoaded", function() {
     let currentAudio           = null;
     let audioResponseReceived  = false;
     let checkInTimer            = null;
+    let vadReady                = false;
     const CHECK_IN_MS           = 10000;
 
     // VAD tuning
-    const SILENCE_THRESHOLD    = 20;   // raised — filters background noise
+    const SILENCE_THRESHOLD    = 15;   // 15/255 — filters noise while catching speech
     const SILENCE_DURATION_MS  = 1800;
     const MIN_SPEECH_CHUNKS    = 3;    // 300ms confirmed speech required
     const MAX_RECORD_MS        = 12000;
@@ -219,7 +220,7 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function checkVAD() {
-        if (!analyser || !isConversationActive) return;
+        if (!analyser || !isConversationActive || !vadReady) return;
         const buf = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteFrequencyData(buf);
         let sum = 0;
@@ -316,13 +317,18 @@ document.addEventListener("DOMContentLoaded", function() {
         const ok = await initMic();
         if (!ok) return;
         isConversationActive = true;
+        vadReady = false;
         setStatus('listening');
         connectWebSocket();
-        resetCheckInTimer();
+        setTimeout(() => {
+            vadReady = true;
+            resetCheckInTimer();
+        }, 2000);
     });
 
     stopBtn.addEventListener('click', function() {
         isConversationActive = false;
+        vadReady = false;
         clearTimeout(checkInTimer);
         stopVAD(); stopRecording();
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
