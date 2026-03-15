@@ -38,8 +38,8 @@ document.addEventListener("DOMContentLoaded", function() {
     let isConversationActive = false;
     let currentAudio         = null;
     let audioResponseReceived = false;
-    let lastSpeechTime        = 0;     // wall-clock ms of last detected speech
-    const CHECK_IN_MS         = 12000; // ms of silence before "are you still there?"
+    let lastSpeechTime        = 0;     // wall-clock ms of last confirmed speech (not noise)
+    const CHECK_IN_MS         = 10000; // ms of silence before "are you still there?"
 
     // VAD tuning
     const SILENCE_THRESHOLD   = 8;    // avg frequency amplitude (0-255 scale) — low = sensitive
@@ -269,11 +269,10 @@ document.addEventListener("DOMContentLoaded", function() {
         const now = Date.now();
 
         if (avg > SILENCE_THRESHOLD) {
-            // Speech detected
-            silenceStart   = null;
-            hasSpeech      = true;
+            // Possible speech — track it (lastSpeechTime updated only on confirmed speech in submitRecording)
+            silenceStart = null;
+            hasSpeech    = true;
             speechChunks++;
-            lastSpeechTime = now;
         } else {
             // Silence — check if we should fire a check-in immediately
             if (!hasSpeech && lastSpeechTime > 0 && now - lastSpeechTime > CHECK_IN_MS) {

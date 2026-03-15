@@ -30,7 +30,7 @@ document.addEventListener("DOMContentLoaded", function() {
     let currentAudio           = null;
     let audioResponseReceived  = false;
     let lastSpeechTime          = 0;
-    const CHECK_IN_MS           = 12000;
+    const CHECK_IN_MS           = 10000;
 
     // VAD tuning (same as scripts.js)
     const SILENCE_THRESHOLD    = 8;
@@ -207,7 +207,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
         if (avg > SILENCE_THRESHOLD) {
             silenceStart = null; hasSpeech = true; speechChunks++;
-            lastSpeechTime = now;
+            // lastSpeechTime updated only on confirmed speech in submitRecording
         } else {
             // Fire check-in immediately once 10s of silence detected (no speech this round)
             if (!hasSpeech && lastSpeechTime > 0 && now - lastSpeechTime > CHECK_IN_MS) {
