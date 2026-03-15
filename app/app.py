@@ -1,7 +1,13 @@
 import os
 import asyncio
 import aiohttp
-import pyaudio
+try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    pyaudio = None
+    PYAUDIO_AVAILABLE = False
+
 import wave
 import numpy as np
 import requests
@@ -10,7 +16,14 @@ import base64
 from PIL import ImageGrab
 from dotenv import load_dotenv
 from openai import OpenAI
-from faster_whisper import WhisperModel
+
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    WhisperModel = None
+    FASTER_WHISPER_AVAILABLE = False
+
 import soundfile as sf
 from textblob import TextBlob
 from pathlib import Path
@@ -121,6 +134,14 @@ character_audio_file = os.path.join(characters_folder, f"{CHARACTER_NAME}.wav")
 
 # Load Spark-TTS configuration
 sparktts_model = None
+
+# Playback state for interruptible audio (idle | speaking | stopping)
+playback_state = "idle"
+
+def request_playback_stop():
+    """Signal any ongoing audio playback to stop as soon as possible."""
+    global playback_state
+    playback_state = "stopping"
 
 # Initialize Spark-TTS model
 if TTS_PROVIDER == 'sparktts':
@@ -246,7 +267,9 @@ async def play_audio(file_path):
     await asyncio.to_thread(sync_play_audio, file_path)
 
 def sync_play_audio(file_path):
+    global playback_state
     print("Starting audio playback")
+    playback_state = "speaking"
     file_extension = Path(file_path).suffix.lstrip('.').lower()
     
     temp_wav_path = os.path.join(output_dir, 'temp_output.wav')
@@ -264,11 +287,15 @@ def sync_play_audio(file_path):
                     output=True)
     data = wf.readframes(1024)
     while data:
+        # Allow cooperative interruption (barge‑in or manual stop)
+        if playback_state == "stopping":
+            break
         stream.write(data)
         data = wf.readframes(1024)
     stream.stop_stream()
     stream.close()
     p.terminate()
+    playback_state = "idle"
     print("Finished audio playback")
 
     pass
@@ -541,9 +568,39 @@ def sanitize_response(response):
     response = re.sub(r'<think>[\s\S]*?<\/think>', '', response)
     # Remove asterisks and other formatting
     response = re.sub(r'\*.*?\*', '', response)
-    response = re.sub(r'[^\w\s,.\'!?]', '', response)
+    response = re.sub(r'[^\w\s,.\'!?:/-]', ' ', response)
+    # Normalize whitespace
+    response = re.sub(r'\s+', ' ', response)
     # Trim any whitespace
     return response.strip()
+
+def humanize_times_for_tts(text: str) -> str:
+    """Normalize times like 6:00 PM or 18:00 so TTS sounds natural."""
+    # 1) Convert "6:00 pm" -> "6 pm"
+    def _strip_minutes(match):
+        hour = match.group(1)
+        ampm = match.group(2).lower()
+        # Remove any leading zero from hour
+        hour_int = int(hour)
+        return f"{hour_int} {ampm}"
+
+    text = re.sub(r'\b([0-1]?\d):00\s*([AaPp][Mm])\b', _strip_minutes, text)
+
+    # 2) Convert "18:00" style times into 12‑hour with am/pm
+    def _convert_24h(match):
+        hour_str = match.group(1)
+        hour = int(hour_str)
+        if hour == 0:
+            return "12 am"
+        if 1 <= hour <= 11:
+            return f"{hour} am"
+        if hour == 12:
+            return "12 pm"
+        # 13–23
+        return f"{hour-12} pm"
+
+    text = re.sub(r'\b([0-2]?\d):00\b', _convert_24h, text)
+    return text
 
 def analyze_mood(user_input):
     analysis = TextBlob(user_input)
@@ -1406,6 +1463,8 @@ async def user_chatbot_conversation():
             chatbot_response = chatgpt_streamed(user_input, base_system_message, mood, conversation_history)
             conversation_history.append({"role": "assistant", "content": chatbot_response})
             sanitized_response = sanitize_response(chatbot_response)
+            # Make spoken times sound more natural for TTS
+            sanitized_response = humanize_times_for_tts(sanitized_response)
             if len(sanitized_response) > 400:
                 sanitized_response = sanitized_response[:400] + "..."
             prompt2 = sanitized_response

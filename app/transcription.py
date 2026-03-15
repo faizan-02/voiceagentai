@@ -1,5 +1,10 @@
 import os
-import pyaudio
+try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    pyaudio = None
+    PYAUDIO_AVAILABLE = False
 import wave
 import numpy as np
 import aiohttp
@@ -34,6 +39,21 @@ FASTER_WHISPER_LOCAL = os.getenv("FASTER_WHISPER_LOCAL", "true").lower() == "tru
 
 # Initialize whisper model as None to lazy load
 whisper_model = None
+
+# Import the app module so we always read the *live* playback_state value.
+# (Importing `playback_state` directly would capture the string "idle" at
+#  import time and never update when app.py reassigns it.)
+try:
+    from . import app as _app_module
+    def _get_playback_state():
+        return _app_module.playback_state
+    def request_playback_stop():
+        _app_module.request_playback_stop()
+except Exception:
+    def _get_playback_state():
+        return "idle"
+    def request_playback_stop():
+        pass
 
 def initialize_whisper_model():
     """Initialize the Faster Whisper model - only called when needed"""
@@ -171,7 +191,7 @@ async def record_audio(file_path, silence_threshold=512, silence_duration=2.5, c
     wf.writeframes(b''.join(frames))
     wf.close()
 
-async def record_audio_enhanced(send_status_callback=None, silence_threshold=300, silence_duration=2.0):
+async def record_audio_enhanced(send_status_callback=None, silence_threshold=220, silence_duration=1.8):
     """Enhanced audio recording with waiting for speech detection
     
     Args:
@@ -213,8 +233,9 @@ async def record_audio_enhanced(send_status_callback=None, silence_threshold=300
     if send_status_callback:
         await send_status_callback({"action": "waiting_for_speech"})
     
-    # Flush initial buffer
-    for _ in range(5):
+    # Flush initial buffer — 15 frames (~1 s) to clear any residual speaker
+    # echo from the previous TTS playback before we start listening.
+    for _ in range(15):
         stream.read(CHUNK)
         
     initial_silent_chunks = 0
@@ -226,6 +247,12 @@ async def record_audio_enhanced(send_status_callback=None, silence_threshold=300
         if not detect_silence(data, threshold=silence_threshold):
             silence_broken = True
             print("Speech detected, recording started...")
+            # If Sara is currently speaking, treat this as a barge‑in and stop playback
+            try:
+                if _get_playback_state() == "speaking":
+                    request_playback_stop()
+            except Exception:
+                pass
             break
         
         initial_silent_chunks += 1
@@ -246,10 +273,9 @@ async def record_audio_enhanced(send_status_callback=None, silence_threshold=300
                 })
             return None
             
-        # Every 2 seconds, provide feedback
-        if initial_silent_chunks % (2 * int(RATE / CHUNK)) == 0 and initial_silent_chunks > 0 and initial_silent_chunks % (4 * int(RATE / CHUNK)) == 0:
+        # Every few seconds, provide a gentle "still listening" ping
+        if initial_silent_chunks % (4 * int(RATE / CHUNK)) == 0 and initial_silent_chunks > 0:
             if send_status_callback:
-                # Just send a reminder ping, no need for message text as UI now handles this
                 await send_status_callback({
                     "action": "waiting_for_speech"
                 })
@@ -278,7 +304,8 @@ async def record_audio_enhanced(send_status_callback=None, silence_threshold=300
         else:
             silent_chunks = 0
             speaking_chunks += 1
-        if speaking_chunks > silence_duration * (RATE / CHUNK) * 15:  # Allow longer recordings
+        # Reasonable upper bound so a single turn doesn't run forever
+        if speaking_chunks > silence_duration * (RATE / CHUNK) * 10:
             break
             
     print("Enhanced recording stopped.")
@@ -289,16 +316,17 @@ async def record_audio_enhanced(send_status_callback=None, silence_threshold=300
     stream.close()
     p.terminate()
     
-    # If no substantial recording was made, return None
-    if len(frames) < 10:
+    # Require at least ~1 second of audio AND at least 5 chunks of actual speech.
+    # This filters out brief noise spikes that Whisper often hallucinates as words.
+    if len(frames) < 16 or speaking_chunks < 5:
         try:
             os.unlink(temp_filename)
-        except:
+        except Exception:
             pass
         if send_status_callback:
             await send_status_callback({
-                "action": "error", 
-                "message": "Recording too short. Please try again."
+                "action": "error",
+                "message": "Recording too short or no speech detected. Please try again."
             })
         return None
     
@@ -341,9 +369,11 @@ async def transcribe_audio(transcription_model="gpt-4o-mini-transcribe", use_loc
             if send_status_callback:
                 await send_status_message(send_status_callback, msg)
                 
-        # Record audio with enhanced mode
+        # Record audio with enhanced mode tuned for natural, but snappy, turns
         temp_filename = await record_audio_enhanced(
-            send_status_callback=callback_wrapper
+            send_status_callback=callback_wrapper,
+            silence_threshold=350,   # raised to reduce false triggers from background noise
+            silence_duration=1.8     # ~1.5–2s of silence before cutting
         )
         
         if not temp_filename:

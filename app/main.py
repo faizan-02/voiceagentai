@@ -12,6 +12,7 @@ from starlette.background import BackgroundTask
 from .shared import clients, set_current_character, conversation_history, add_client, remove_client
 from .app_logic import start_conversation, stop_conversation, set_env_variable, save_conversation_history, characters_folder, set_transcription_model, fetch_ollama_models, load_character_prompt, save_character_specific_history
 from .enhanced_logic import start_enhanced_conversation, stop_enhanced_conversation
+from .web_voice import router as web_voice_router
 import logging
 from threading import Thread
 import uuid
@@ -61,6 +62,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include web voice router (WebSocket /ws_voice)
+app.include_router(web_voice_router)
+
 @app.get("/", response_class=HTMLResponse)
 async def get_index(request: Request):
     model_provider = os.getenv("MODEL_PROVIDER")
@@ -87,6 +91,11 @@ async def get_index(request: Request):
         "kokoro_voice": kokoro_voice,
         "faster_whisper_local": faster_whisper_local,
     })
+
+@app.get("/voice", response_class=HTMLResponse)
+async def get_voice(request: Request):
+    return templates.TemplateResponse("voice.html", {"request": request})
+
 
 @app.get("/characters")
 async def get_characters():
@@ -443,7 +452,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 await stop_conversation()
             elif message["action"] == "start":
                 selected_character = message["character"]
-                await stop_conversation()  # Ensure any running conversation stops
+                # Stop any currently playing audio without triggering the goodbye flow.
+                # The session ID inside start_conversation() will abort any stale loop.
+                try:
+                    from .app import request_playback_stop
+                    request_playback_stop()
+                except Exception:
+                    pass
                 set_current_character(selected_character)
                 await start_conversation()
             elif message["action"] == "set_character":

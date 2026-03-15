@@ -1,9 +1,26 @@
 import os
 import asyncio
+import threading
+import uuid as _uuid
 from threading import Thread
 from fastapi import APIRouter
 from pydantic import BaseModel
 from .shared import clients, continue_conversation, conversation_history
+
+# Session ID to cancel stale conversation loops when Start is clicked again
+_current_session_id: str = ""
+
+def _run_coro_in_new_loop(coro):
+    """Run an async coroutine in a brand-new event loop in the current thread.
+    Used to run TTS independently so the recording event loop is never blocked."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(coro)
+    except Exception as e:
+        print(f"TTS thread error: {e}")
+    finally:
+        loop.close()
 from .app import (
     analyze_mood,
     chatgpt_streamed,
@@ -23,6 +40,7 @@ from .app import (
     init_voice_speed,
     save_conversation_history,
     send_message_to_clients,
+    request_playback_stop,
 )
 from .transcription import transcribe_audio
 import json
@@ -47,9 +65,10 @@ characters_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath
 MAX_CHAR_LENGTH = int(os.getenv('MAX_CHAR_LENGTH', 500))
 
 # Global variable to store the current transcription model
-FASTER_WHISPER_LOCAL = os.getenv("FASTER_WHISPER_LOCAL", "true").lower() == "true"
+# Default to cloud transcription for speed; local Whisper can be enabled explicitly
+FASTER_WHISPER_LOCAL = os.getenv("FASTER_WHISPER_LOCAL", "false").lower() == "true"
 current_transcription_model = "gpt-4o-mini-transcribe"
-use_local_whisper = FASTER_WHISPER_LOCAL  # Initialize based on environment
+use_local_whisper = FASTER_WHISPER_LOCAL
 
 # Function to update the transcription model
 def set_transcription_model(model_name):
@@ -107,23 +126,31 @@ async def process_text(user_input):
     if len(sanitized_response) > MAX_CHAR_LENGTH:
         sanitized_response = sanitized_response[:MAX_CHAR_LENGTH] + "..."
     prompt2 = sanitized_response
-    await process_and_play(prompt2, character_audio_file)
+    # Run TTS in a dedicated thread with its own event loop.
+    # We return the thread so conversation_loop can join() it before opening
+    # the microphone — this prevents the mic from picking up the speaker output.
+    tts_thread = threading.Thread(
+        target=_run_coro_in_new_loop,
+        args=(process_and_play(prompt2, character_audio_file),),
+        daemon=True,
+        name="tts-playback"
+    )
+    tts_thread.start()
 
     conversation_history.append({"role": "assistant", "content": chatbot_response})
-    
+
     # Check if this is a story or game character
     is_story_character = current_character.startswith("story_") or current_character.startswith("game_")
-    
+
     if is_story_character:
-        # Save to character-specific history file
         save_character_specific_history(conversation_history, current_character)
         print(f"Saved character-specific history for {current_character}")
     else:
-        # Save to global history file
         save_conversation_history(conversation_history)
         print(f"Saved global history for {current_character}")
-        
-    return chatbot_response
+
+    # Return both so the caller can wait for TTS before listening
+    return chatbot_response, tts_thread
 
 quit_phrases = ["quit", "Quit", "Quit.", "Exit.", "exit", "Exit"]
 screenshot_phrases = [
@@ -138,8 +165,13 @@ screenshot_phrases = [
 
 @router.post("/start_conversation")
 async def start_conversation():
-    global continue_conversation # noqa: F824
-    
+    global continue_conversation, _current_session_id # noqa: F824
+
+    # Mint a new session ID — any older conversation_loop thread will see a mismatch
+    # and exit cleanly rather than triggering a stale "goodbye".
+    _current_session_id = str(_uuid.uuid4())
+    session_id = _current_session_id
+
     # Set flag to continue conversation
     continue_conversation = True
     
@@ -223,31 +255,125 @@ async def start_conversation():
     # print("Waiting for speech...")
     await send_message_to_clients({"type": "waiting"})
     
-    # Start conversation thread
-    Thread(target=asyncio.run, args=(conversation_loop(),)).start()
+    # Start conversation thread — pass session_id so stale threads self-abort
+    Thread(target=asyncio.run, args=(conversation_loop(session_id),), daemon=True).start()
     
     return {"status": "started"}
 
 @router.post("/stop_conversation")
 async def stop_conversation():
     global continue_conversation # noqa: F824
+
+    # Stop any currently playing audio immediately so goodbye can be heard
+    try:
+        request_playback_stop()
+    except Exception:
+        pass
+
     continue_conversation = False
+
+    try:
+        from .shared import conversation_history, get_current_character as get_character
+        current_character = get_character()
+        save_conversation_history(conversation_history)
+
+        # Speak a goodbye message in the character's voice
+        goodbye_text = "Goodbye! It was a pleasure chatting with you. Feel free to start a new conversation whenever you're ready."
+        character_folder = os.path.join('characters', current_character)
+        character_audio_file = os.path.join(character_folder, f"{current_character}.wav")
+        try:
+            await process_and_play(goodbye_text, character_audio_file)
+        except Exception as e:
+            print(f"Error playing goodbye audio: {e}")
+
+        await send_message_to_clients({
+            "action": "conversation_ended",
+            "message": goodbye_text
+        })
+    except Exception as e:
+        print(f"Error while stopping conversation: {e}")
     return {"message": "Conversation stopped"}
 
-async def conversation_loop():
-    global continue_conversation # noqa: F824
-    
+async def conversation_loop(session_id: str = ""):
+    global continue_conversation, _current_session_id # noqa: F824
+
     # Import with alias to avoid potential shadowing issues
     from .shared import get_current_character as get_character
-    
+
+    # Track consecutive times where no speech was detected
+    no_speech_turns = 0
+
     while continue_conversation:
-        user_input = await record_audio_and_transcribe() 
-        
-        # Check if user_input is None and handle it
+        # Abort if a newer session has started (user clicked Start again)
+        if session_id and session_id != _current_session_id:
+            print(f"Stale conversation loop detected (session {session_id[:8]}), exiting.")
+            break
+
+        user_input = await record_audio_and_transcribe()
+
+        # Abort again after the long blocking record call in case Start was clicked
+        if session_id and session_id != _current_session_id:
+            print(f"Stale conversation loop aborting after record (session {session_id[:8]}).")
+            break
+
+        # Check if user_input is None and handle it (no speech detected for ~10-15 seconds)
         if user_input is None:
-            print("Warning: Received None input from transcription")
+            # Always re-check session before acting on a None — the user may have
+            # clicked Start again while we were blocked in the recording call.
+            if session_id and session_id != _current_session_id:
+                print(f"Stale loop detected at no-speech handler, aborting silently.")
+                break
+
+            no_speech_turns += 1
+            print(f"Warning: No speech detected (turn {no_speech_turns}).")
+
+            if no_speech_turns == 1:
+                # First time: gently ask if the user is still there
+                check_in_text = "Hey, are you still there? Take your time, I'm listening."
+                await send_message_to_clients(check_in_text)
+
+                # Speak it via TTS — wait for it to finish before re-opening the mic
+                # so the mic doesn't pick up the check-in audio (which would cause
+                # another spurious None and an immediate goodbye).
+                try:
+                    current_char = get_character()
+                    char_folder = os.path.join('characters', current_char)
+                    char_audio = os.path.join(char_folder, f"{current_char}.wav")
+                    checkin_thread = threading.Thread(
+                        target=_run_coro_in_new_loop,
+                        args=(process_and_play(check_in_text, char_audio),),
+                        daemon=True,
+                        name="tts-checkin"
+                    )
+                    checkin_thread.start()
+                    # Wait for TTS to finish + echo decay before recording again
+                    await asyncio.to_thread(checkin_thread.join)
+                    await asyncio.sleep(0.6)
+                except Exception as e:
+                    print(f"Error playing check-in audio: {e}")
+                continue
+            elif no_speech_turns >= 3:
+                # Three consecutive no-speech turns: end the conversation gracefully
+                # without calling the full stop_conversation() so a race with a new
+                # session can't accidentally play goodbye into a fresh conversation.
+                print("Three consecutive no-speech turns. Ending conversation loop.")
+                continue_conversation = False
+                await send_message_to_clients({
+                    "action": "conversation_ended",
+                    "message": "Ending conversation due to inactivity."
+                })
+                break
+            else:
+                # no_speech_turns == 2: keep waiting (will try one more time)
+                continue
+        else:
+            # Reset counter when we successfully hear the user
+            no_speech_turns = 0
+
+        # Ignore empty or very-short transcriptions (common Whisper noise artefacts)
+        if not user_input or len(user_input.strip()) < 2:
             continue
-            
+
         conversation_history.append({"role": "user", "content": user_input})
         
         # Get current character to check if it's a story/game character
@@ -262,12 +388,21 @@ async def conversation_loop():
             save_conversation_history(conversation_history)
             # print(f"Saved user input to global history for {current_character}")
             
+        # Stop any ongoing AI speech before processing the new user input (barge-in)
+        try:
+            request_playback_stop()
+        except Exception:
+            pass
+
         await send_message_to_clients(f"You: {user_input}")
         print(CYAN + f"You: {user_input}" + RESET_COLOR)
 
         # Check for quit phrases with word boundary check
         words = user_input.lower().split()
         if any(phrase.lower().rstrip('.') == word for phrase in quit_phrases for word in words):
+            # Only quit if this session is still the active one
+            if session_id and session_id != _current_session_id:
+                break
             print("Quitting the conversation...")
             await stop_conversation()
             break
@@ -278,13 +413,35 @@ async def conversation_loop():
             continue
 
         try:
-            chatbot_response = await process_text(user_input)
+            # Keep any extra delay minimal; default to no artificial wait
+            try:
+                delay_seconds = float(os.getenv("RESPONSE_DELAY_SECONDS", "0.0"))
+            except ValueError:
+                delay_seconds = 0.0
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+            # Notify UI that the AI is processing (thinking)
+            await send_message_to_clients({"action": "thinking"})
+            chatbot_response, tts_thread = await process_text(user_input)
+            await send_message_to_clients({"action": "thinking_done"})
         except Exception as e:
             chatbot_response = f"An error occurred: {e}"
+            tts_thread = None
             print(chatbot_response)
+            await send_message_to_clients({"action": "thinking_done"})
 
         current_character = get_character()
         await send_message_to_clients(chatbot_response)
+
+        # ── Echo prevention ──────────────────────────────────────────────────
+        # Wait for TTS to finish playing before opening the microphone.
+        # Without this the mic picks up the speaker output and the AI talks
+        # to itself in a loop.
+        if tts_thread is not None and tts_thread.is_alive():
+            await asyncio.to_thread(tts_thread.join)
+        # Extra silence gap so room echo decays before we start recording
+        await asyncio.sleep(0.6)
         # await send_message_to_clients(f"{current_character.capitalize()}: {chatbot_response}") # to use for character names
         # print(f"{current_character.capitalize()}: {chatbot_response}")
 

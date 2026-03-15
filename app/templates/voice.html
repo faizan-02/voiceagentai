@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice Chat AI</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:           #0f0f0f;
+      --surface:      #1a1a1a;
+      --surface2:     #242424;
+      --border:       #2e2e2e;
+      --text:         #e8e8e8;
+      --text-muted:   #888;
+      --accent-blue:  #3b82f6;
+      --accent-yellow:#f59e0b;
+      --accent-green: #22c55e;
+      --accent-grey:  #4b5563;
+      --radius:       12px;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.5;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 24px 16px 40px;
+      gap: 24px;
+    }
+
+    /* ── Header ───────────────────────────────────────────────── */
+    header {
+      text-align: center;
+    }
+    header h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    header p {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    /* ── Orb / animated circle ────────────────────────────────── */
+    .orb-wrapper {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 18px;
+    }
+
+    .orb {
+      width: 160px;
+      height: 160px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 35%, #6b7280, #374151);
+      box-shadow: 0 0 0 0 rgba(107, 114, 128, 0.4);
+      transition: background 0.4s ease, box-shadow 0.4s ease;
+      cursor: default;
+      position: relative;
+    }
+
+    /* idle */
+    .orb.idle {
+      background: radial-gradient(circle at 35% 35%, #6b7280, #374151);
+      box-shadow: 0 0 0 0 rgba(107, 114, 128, 0.4);
+    }
+
+    /* listening — blue pulsing */
+    .orb.listening {
+      background: radial-gradient(circle at 35% 35%, #60a5fa, #1d4ed8);
+      box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.6);
+      animation: pulse-blue 1.6s ease-in-out infinite;
+    }
+    @keyframes pulse-blue {
+      0%   { box-shadow: 0 0 0 0   rgba(59, 130, 246, 0.6); }
+      70%  { box-shadow: 0 0 0 28px rgba(59, 130, 246, 0); }
+      100% { box-shadow: 0 0 0 0   rgba(59, 130, 246, 0); }
+    }
+
+    /* thinking — yellow pulsing */
+    .orb.thinking {
+      background: radial-gradient(circle at 35% 35%, #fcd34d, #b45309);
+      box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.6);
+      animation: pulse-yellow 1s ease-in-out infinite;
+    }
+    @keyframes pulse-yellow {
+      0%   { box-shadow: 0 0 0 0   rgba(245, 158, 11, 0.6); }
+      70%  { box-shadow: 0 0 0 28px rgba(245, 158, 11, 0); }
+      100% { box-shadow: 0 0 0 0   rgba(245, 158, 11, 0); }
+    }
+
+    /* speaking — green pulsing */
+    .orb.speaking {
+      background: radial-gradient(circle at 35% 35%, #4ade80, #15803d);
+      box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6);
+      animation: pulse-green 0.9s ease-in-out infinite;
+    }
+    @keyframes pulse-green {
+      0%   { box-shadow: 0 0 0 0   rgba(34, 197, 94, 0.6); }
+      70%  { box-shadow: 0 0 0 28px rgba(34, 197, 94, 0); }
+      100% { box-shadow: 0 0 0 0   rgba(34, 197, 94, 0); }
+    }
+
+    .status-text {
+      font-size: 1rem;
+      color: var(--text-muted);
+      min-height: 1.4em;
+      text-align: center;
+      transition: color 0.3s;
+    }
+
+    /* ── Transcript ───────────────────────────────────────────── */
+    .transcript-panel {
+      width: 100%;
+      max-width: 600px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      max-height: 260px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      scroll-behavior: smooth;
+    }
+
+    .transcript-panel::-webkit-scrollbar { width: 6px; }
+    .transcript-panel::-webkit-scrollbar-track { background: transparent; }
+    .transcript-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    .transcript-empty {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      text-align: center;
+      padding: 12px 0;
+    }
+
+    .message {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .message .label {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .message.user .label  { color: var(--accent-blue); }
+    .message.ai   .label  { color: var(--accent-green); }
+    .message .content {
+      font-size: 0.9rem;
+      color: var(--text);
+      background: var(--surface2);
+      border-radius: 8px;
+      padding: 8px 12px;
+    }
+
+    /* ── Settings ─────────────────────────────────────────────── */
+    .settings-toggle {
+      width: 100%;
+      max-width: 600px;
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      padding: 10px 16px;
+      text-align: left;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .settings-toggle:hover { border-color: var(--accent-blue); color: var(--text); }
+    .settings-toggle .arrow { transition: transform 0.25s; }
+    .settings-toggle.open .arrow { transform: rotate(180deg); }
+
+    .settings-panel {
+      width: 100%;
+      max-width: 600px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      display: none;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .settings-panel.open { display: flex; }
+
+    .setting-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .setting-row label {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .setting-row select,
+    .setting-row input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.9rem;
+      padding: 8px 12px;
+      outline: none;
+      transition: border-color 0.2s;
+      width: 100%;
+    }
+    .setting-row select:focus,
+    .setting-row input:focus { border-color: var(--accent-blue); }
+
+    /* ── Controls ─────────────────────────────────────────────── */
+    .controls {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+    }
+
+    .btn {
+      border: none;
+      border-radius: 50px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+    }
+    .btn:active { transform: scale(0.96); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-start {
+      background: var(--accent-blue);
+      color: #fff;
+      padding: 14px 40px;
+    }
+    .btn-stop {
+      background: #ef4444;
+      color: #fff;
+      padding: 14px 32px;
+      display: none;
+    }
+
+    /* ── Error toast ──────────────────────────────────────────── */
+    .error-toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #7f1d1d;
+      color: #fca5a5;
+      border: 1px solid #991b1b;
+      border-radius: 10px;
+      padding: 12px 20px;
+      font-size: 0.88rem;
+      max-width: 420px;
+      text-align: center;
+      display: none;
+      z-index: 999;
+      animation: fade-in 0.2s ease;
+    }
+    @keyframes fade-in { from { opacity:0; transform:translateX(-50%) translateY(8px); } to { opacity:1; transform:translateX(-50%) translateY(0); } }
+
+    /* ── Responsive ───────────────────────────────────────────── */
+    @media (max-width: 480px) {
+      .orb { width: 130px; height: 130px; }
+      header h1 { font-size: 1.3rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <h1>Voice Chat AI</h1>
+    <p>Browser-based voice conversation</p>
+  </header>
+
+  <!-- Orb -->
+  <div class="orb-wrapper">
+    <div class="orb idle" id="orb"></div>
+    <div class="status-text" id="statusText">Tap Start to begin</div>
+  </div>
+
+  <!-- Transcript -->
+  <div class="transcript-panel" id="transcriptPanel">
+    <div class="transcript-empty" id="transcriptEmpty">Your conversation will appear here.</div>
+  </div>
+
+  <!-- Settings toggle -->
+  <button class="settings-toggle" id="settingsToggle" aria-expanded="false">
+    <span>Settings</span>
+    <span class="arrow">&#9660;</span>
+  </button>
+
+  <!-- Settings panel -->
+  <div class="settings-panel" id="settingsPanel" role="region" aria-label="Settings">
+    <div class="setting-row">
+      <label for="characterSelect">Character</label>
+      <select id="characterSelect">
+        <option value="">Loading characters…</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label for="modelSelect">Model</label>
+      <select id="modelSelect">
+        <option value="gpt-4o-mini">gpt-4o-mini</option>
+        <option value="gpt-4o">gpt-4o</option>
+        <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+        <option value="gpt-4.1">gpt-4.1</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label for="voiceSelect">TTS Voice</label>
+      <select id="voiceSelect">
+        <option value="alloy">alloy</option>
+        <option value="echo">echo</option>
+        <option value="fable">fable</option>
+        <option value="onyx">onyx</option>
+        <option value="nova" selected>nova</option>
+        <option value="shimmer">shimmer</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <button class="btn btn-start" id="btnStart">Start</button>
+    <button class="btn btn-stop"  id="btnStop">Stop</button>
+  </div>
+
+  <!-- Error toast -->
+  <div class="error-toast" id="errorToast"></div>
+
+  <script src="/app/static/js/voice.js"></script>
+</body>
+</html>

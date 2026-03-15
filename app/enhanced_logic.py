@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import uuid as _uuid
 from threading import Thread
 from fastapi import APIRouter
 from .shared import clients, conversation_history, is_client_active, set_client_inactive
@@ -20,6 +21,9 @@ from .app_logic import (
 from .transcription import transcribe_audio
 
 router = APIRouter()
+
+# Session ID — updated on every Start so stale loops self-abort
+_enhanced_session_id: str = ""
 
 # Enhanced-specific variables
 enhanced_conversation_active = False
@@ -420,40 +424,36 @@ async def enhanced_text_to_speech(text, detected_mood=None):
                     # Signal that audio is about to play (for animation synchronization)
                     await send_message_to_enhanced_clients({"action": "audio_actually_playing"})
                     
-                    # Play audio using PyAudio - similar to the main page implementation
-                    try:
-                        wf = wave.open(enhanced_audio_filename, 'rb')
-                        p = pyaudio.PyAudio()
-                        
-                        # Set up a buffered stream for lower latency
-                        # Use a smaller buffer size for quicker start (512 instead of 1024)
+                    # Play audio using PyAudio — run blocking I/O in a thread
+                    # so the event loop stays responsive for WebSocket sends.
+                    def _play_wav_sync(filename):
                         buffer_size = 1024
-                        
-                        stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
-                                        channels=wf.getnchannels(),
-                                        rate=wf.getframerate(),
-                                        output=True,
-                                        frames_per_buffer=buffer_size)
-                        
-                        # Read initial data to start quickly
-                        data = wf.readframes(buffer_size)
-                        
-                        # Stream the audio data
-                        while data and len(data) > 0:
-                            stream.write(data)
+                        try:
+                            wf = wave.open(filename, 'rb')
+                            p = pyaudio.PyAudio()
+                            stream = p.open(
+                                format=p.get_format_from_width(wf.getsampwidth()),
+                                channels=wf.getnchannels(),
+                                rate=wf.getframerate(),
+                                output=True,
+                                frames_per_buffer=buffer_size,
+                            )
                             data = wf.readframes(buffer_size)
-                            
-                        # Clean up resources
-                        stream.stop_stream()
-                        stream.close()
-                        p.terminate()
-                        wf.close()  # Close the wave file properly
-                        
+                            while data and len(data) > 0:
+                                stream.write(data)
+                                data = wf.readframes(buffer_size)
+                            stream.stop_stream()
+                            stream.close()
+                            p.terminate()
+                            wf.close()
+                        except Exception as exc:
+                            print(f"Error playing audio: {exc}")
+
+                    try:
+                        await asyncio.to_thread(_play_wav_sync, enhanced_audio_filename)
                     except Exception as e:
-                        print(f"Error playing audio: {e}")
-                        # Just wait an estimated amount of time if playback fails
-                        estimated_duration = len(text) * 0.08
-                        await asyncio.sleep(estimated_duration)
+                        print(f"Error in audio playback thread: {e}")
+                        await asyncio.sleep(len(text) * 0.08)
                     
                 else:
                     error_text = await response.text()
@@ -472,9 +472,9 @@ async def enhanced_text_to_speech(text, detected_mood=None):
         # Make sure to stop speaking in case of error
         await send_message_to_enhanced_clients({"action": "ai_stop_speaking"})
 
-async def enhanced_conversation_loop():
+async def enhanced_conversation_loop(session_id: str = ""):
     """Main conversation loop for the enhanced interface."""
-    global enhanced_conversation_active, conversation_history
+    global enhanced_conversation_active, conversation_history, _enhanced_session_id
 
     # Import get_current_character at the top level to avoid shadowing
     from .shared import get_current_character as get_character
@@ -526,6 +526,11 @@ async def enhanced_conversation_loop():
                 
         # Main conversation loop
         while enhanced_conversation_active:
+            # Abort if a newer session has started (user clicked Start again)
+            if session_id and session_id != _enhanced_session_id:
+                print(f"Stale enhanced loop detected (session {session_id[:8]}), exiting.")
+                break
+
             try:
                 # Update client status
                 await send_message_to_enhanced_clients({"action": "status", "status": "ready"})
@@ -535,12 +540,16 @@ async def enhanced_conversation_loop():
                 
                 # Wait for user to speak
                 user_input = await record_enhanced_audio_and_transcribe()
-                
-                # Check if there was an error in transcription
-                if not user_input or user_input == "ERROR":
-                    print("Error transcribing audio or no speech detected")
+
+                # Abort if a newer session started while we were recording
+                if session_id and session_id != _enhanced_session_id:
+                    print(f"Stale enhanced loop aborting after record (session {session_id[:8]}).")
+                    break
+
+                # Check if there was an error in transcription or result is too short
+                if not user_input or user_input == "ERROR" or len(user_input.strip()) < 2:
+                    print("No speech detected, transcription error, or noise artefact — skipping.")
                     await send_message_to_enhanced_clients({"action": "mic", "status": "off"})
-                    await send_message_to_enhanced_clients({"message": "No speech detected or there was an error. Please try again.", "type": "system-message"})
                     continue
                 
                 # Print user input to CLI with "You:" prefix
@@ -604,8 +613,9 @@ async def enhanced_conversation_loop():
                     if len(local_conversation_history) > 30:
                         local_conversation_history = local_conversation_history[-30:]
                 
-                # Update conversation history
-                conversation_history = local_conversation_history.copy()
+                # Update the shared conversation_history list in-place (avoids rebinding the import)
+                conversation_history.clear()
+                conversation_history.extend(local_conversation_history)
                 
                 # Save history based on character type
                 await save_history()
@@ -635,12 +645,13 @@ async def enhanced_conversation_loop():
     except Exception as e:
         print(f"Error in enhanced conversation loop: {e}")
     finally:
-        # Always make sure to turn off the mic status indicator
+        # Always reset mic and notify the UI so buttons re-enable correctly
         try:
             await send_message_to_enhanced_clients({"action": "mic", "status": "off"})
-        except:
+            await send_message_to_enhanced_clients({"action": "conversation_stopped"})
+        except Exception:
             pass
-        
+
         # Set active flag to False
         enhanced_conversation_active = False
 
@@ -776,7 +787,7 @@ async def enhanced_chat_completion(prompt, system_message, mood_prompt, conversa
 
 async def start_enhanced_conversation(character=None, speed=None, model=None, voice=None, ttsModel=None, transcriptionModel=None):
     """Start a new enhanced conversation."""
-    global enhanced_conversation_active, enhanced_conversation_thread, enhanced_speed, enhanced_voice, enhanced_model, enhanced_tts_model, enhanced_transcription_model, conversation_history
+    global enhanced_conversation_active, enhanced_conversation_thread, enhanced_speed, enhanced_voice, enhanced_model, enhanced_tts_model, enhanced_transcription_model, conversation_history, _enhanced_session_id
     
     # Import get_current_character at the top level to avoid shadowing
     from .shared import get_current_character as get_character
@@ -912,11 +923,19 @@ async def start_enhanced_conversation(character=None, speed=None, model=None, vo
             # File doesn't exist or is empty
             conversation_history = []
     
+    # Mint a new session ID so any previously-running loop self-aborts
+    _enhanced_session_id = str(_uuid.uuid4())
+    session_id = _enhanced_session_id
+
     # Set active flag
     enhanced_conversation_active = True
-    
+
     # Start the conversation in a separate thread
-    enhanced_conversation_thread = Thread(target=asyncio.run, args=(enhanced_conversation_loop(),))
+    enhanced_conversation_thread = Thread(
+        target=asyncio.run,
+        args=(enhanced_conversation_loop(session_id),),
+        daemon=True,
+    )
     enhanced_conversation_thread.start()
     
     return {"status": "started"}
