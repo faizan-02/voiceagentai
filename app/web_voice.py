@@ -20,6 +20,7 @@ Protocol (browser ↔ server):
 
 import asyncio
 import base64
+from datetime import date
 import json
 import logging
 import os
@@ -328,6 +329,9 @@ async def ws_voice_endpoint(websocket: WebSocket):
                         "ws_voice: character prompt not found at %s — using fallback",
                         prompt_path,
                     )
+                # Prepend current date so the LLM always knows what day it is
+                today_str = date.today().strftime("%A, %d %B %Y")
+                system_msg = f"Today's date is {today_str}.\n\n" + system_msg
 
                 # 5. Generate AI response (sync → executor)
                 try:
@@ -410,6 +414,8 @@ async def ws_voice_endpoint(websocket: WebSocket):
                     system_msg = open_file(prompt_path)
                 except Exception:
                     system_msg = f"You are {character.capitalize()}, a helpful AI assistant."
+                today_str = date.today().strftime("%A, %d %B %Y")
+                system_msg = f"Today's date is {today_str}.\n\n" + system_msg
 
                 try:
                     loop = asyncio.get_event_loop()
