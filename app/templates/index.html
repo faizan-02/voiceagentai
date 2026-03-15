@@ -95,23 +95,100 @@
         </div>
     </header>
     <main>
-        <div id="conversation">
-            <div id="messages"></div>
-            <div id="voice-animation" class="hidden">
-                <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                    <circle cx="50" cy="50" r="45" fill="none" stroke="currentColor" stroke-width="8" />
-                    <g id="voice-bars">
-                        <rect x="30" y="35" width="8" height="30" rx="4" />
-                        <rect x="46" y="25" width="8" height="50" rx="4" />
-                        <rect x="62" y="35" width="8" height="30" rx="4" />
-                    </g>
-                </svg>
+        <div id="cloud-notice" style="display:none;background:#1a3a2a;border:1px solid #2ecc71;color:#2ecc71;padding:10px 16px;border-radius:8px;margin:10px 16px;font-size:0.9rem;">
+            ☁️ Running in cloud mode — server-side mic is unavailable. Use the
+            <a href="/voice" style="color:#2ecc71;font-weight:bold;">Voice Page</a>
+            for full browser-based voice chat.
+        </div>
+        <script>
+            // Show cloud notice when not running locally
+            if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+                document.getElementById('cloud-notice').style.display = 'block';
+            }
+        </script>
+        <div class="main-layout">
+            <div id="conversation">
+                <div id="messages"></div>
+                <div id="voice-animation" class="hidden">
+                    <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="50" cy="50" r="45" fill="none" stroke="currentColor" stroke-width="8" />
+                        <g id="voice-bars">
+                            <rect x="30" y="35" width="8" height="30" rx="4" />
+                            <rect x="46" y="25" width="8" height="50" rx="4" />
+                            <rect x="62" y="35" width="8" height="30" rx="4" />
+                        </g>
+                    </svg>
+                </div>
             </div>
+            <aside id="spa-sidebar" class="spa-sidebar hidden">
+                <h2>Islamabad Spa Salon</h2>
+                <p class="spa-tagline">Bookings, prices, and availability with Sara.</p>
+                
+                <section class="spa-section">
+                    <h3>Quick Booking Calendar</h3>
+                    <div id="spa-today" class="spa-today"></div>
+                    <div id="spa-calendar" class="spa-calendar"></div>
+                    <div id="spa-selected-date" class="spa-selected-date">Select a date you like and tell Sara that date in your own words.</div>
+                </section>
+
+                <section class="spa-section">
+                    <h3>Popular Services & Prices (PKR)</h3>
+                    <div class="spa-services">
+                        <div class="spa-service-card">
+                            <h4>Massages</h4>
+                            <ul>
+                                <li>Classic Swedish – 60 min – 7,500</li>
+                                <li>Deep Tissue – 60 min – 8,500</li>
+                                <li>Aromatherapy – 90 min – 11,500</li>
+                            </ul>
+                        </div>
+                        <div class="spa-service-card">
+                            <h4>Facials</h4>
+                            <ul>
+                                <li>Glow Facial – 60 min – 6,000</li>
+                                <li>Hydrating Facial – 75 min – 7,500</li>
+                                <li>Anti‑Aging – 90 min – 9,500</li>
+                            </ul>
+                        </div>
+                        <div class="spa-service-card">
+                            <h4>Hair</h4>
+                            <ul>
+                                <li>Cut & Blow‑dry – from 4,000</li>
+                                <li>Root Touch‑up – from 5,500</li>
+                                <li>Full Color – from 8,500</li>
+                            </ul>
+                        </div>
+                        <div class="spa-service-card">
+                            <h4>Nails & Packages</h4>
+                            <ul>
+                                <li>Manicure – 2,800</li>
+                                <li>Pedicure – 3,200</li>
+                                <li>Relax & Glow – 13,000</li>
+                                <li>Full Pamper Day – 19,500</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <p class="spa-hint">Tell Sara which service, which day, and roughly what time works for you.</p>
+                </section>
+            </aside>
+        </div>
+        <div id="status-bar" class="status-bar status-idle">
+            <span class="status-dot">○</span>
+            <span class="status-label">Ready — press Start to begin</span>
         </div>
         <div class="controls">
-            <button id="start-conversation-btn">Start</button>
-            <button id="stop-conversation-btn">Stop</button>
-            <button id="clear-conversation-btn">Clear</button>
+            <button id="start-conversation-btn" class="btn-start btn-active">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:6px"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                Start
+            </button>
+            <button id="stop-conversation-btn" class="btn-stop" disabled>
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:6px"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+                End
+            </button>
+            <button id="clear-conversation-btn" class="btn-clear">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:6px"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                Clear
+            </button>
         </div>
         <div class="settings">
             <div class="setting-group">

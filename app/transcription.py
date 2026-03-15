@@ -196,15 +196,24 @@ async def record_audio(file_path, silence_threshold=512, silence_duration=2.5, c
 
 async def record_audio_enhanced(send_status_callback=None, silence_threshold=220, silence_duration=1.8):
     """Enhanced audio recording with waiting for speech detection
-    
+
     Args:
         send_status_callback: Callback to send status messages
         silence_threshold: Threshold for silence detection
         silence_duration: Duration of silence to stop recording
-    
+
     Returns:
         Path to the recorded audio file
     """
+    # PyAudio is not available (cloud deployment has no audio hardware)
+    if not PYAUDIO_AVAILABLE:
+        if send_status_callback:
+            await send_status_callback({
+                "action": "error",
+                "message": "Server-side microphone is not available in cloud deployment. Please use the /voice page instead."
+            })
+        return None
+
     # Create temp file
     temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     temp_filename = temp_file.name
