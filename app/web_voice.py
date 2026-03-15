@@ -41,6 +41,86 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
+# Booking extraction helpers
+# ---------------------------------------------------------------------------
+
+_MONTHS_MAP = {
+    'january': 'January', 'february': 'February', 'march': 'March',
+    'april': 'April', 'may': 'May', 'june': 'June', 'july': 'July',
+    'august': 'August', 'september': 'September', 'october': 'October',
+    'november': 'November', 'december': 'December',
+}
+
+# Service keywords → (canonical name, price, duration)  Order matters — more specific first
+_SERVICES_MAP = [
+    (['gel manicure'],                      'Gel Manicure',           '4,200 PKR',        None),
+    (['classic swedish', 'swedish massage', 'swedish'], 'Classic Swedish Massage', '7,500 PKR', '60 min'),
+    (['deep tissue'],                       'Deep Tissue Massage',    '8,500 PKR',        '60 min'),
+    (['aromatherapy'],                      'Aromatherapy Massage',   '11,500 PKR',       '90 min'),
+    (['glow facial'],                       'Glow Facial',            '6,000 PKR',        '60 min'),
+    (['hydrating facial', 'hydrating'],     'Hydrating Facial',       '7,500 PKR',        '75 min'),
+    (['anti aging', 'anti-aging', 'anti ageing', 'anti-ageing'], 'Anti-Aging Facial', '9,500 PKR', '90 min'),
+    (['keratin', 'smoothening', 'smoothing'], 'Keratin Treatment',   'from 18,000 PKR',  None),
+    (['haircut', 'blow dry', 'blow-dry'],   'Haircut & Blow-dry',     'from 4,000 PKR',   None),
+    (['root touch'],                        'Root Touch-up',          'from 5,500 PKR',   None),
+    (['full color', 'full colour'],         'Full Color',             'from 8,500 PKR',   None),
+    (['manicure'],                          'Classic Manicure',       '2,800 PKR',        None),
+    (['pedicure'],                          'Classic Pedicure',       '3,200 PKR',        None),
+    (['relax and glow', 'relax & glow', 'relax glow'], 'Relax & Glow Package', '13,000 PKR', None),
+    (['full pamper', 'pamper day'],         'Full Pamper Day',        '19,500 PKR',       None),
+]
+
+_CONFIRMATION_PHRASES = [
+    'reserved', 'our team will confirm', "you're all set", 'see you on',
+    'looking forward to seeing you', "we'll be in touch", 'all booked',
+]
+
+
+def _extract_booking_info(text: str) -> dict:
+    """Extract date and/or service mention from user text. Returns dict with found fields only."""
+    import re
+    text_l = text.lower()
+    result = {}
+
+    # --- Date extraction ---
+    day_re = r'(\d{1,2})(?:st|nd|rd|th)?'
+    for month_key, month_display in _MONTHS_MAP.items():
+        # "20th March" / "20 of March"
+        m = re.search(day_re + r'\s+(?:of\s+)?' + month_key, text_l)
+        if m:
+            day = int(m.group(1))
+            if 1 <= day <= 31:
+                result['date'] = f"{day} {month_display}"
+                break
+        # "March 20th"
+        m = re.search(month_key + r'\s+' + day_re, text_l)
+        if m:
+            day = int(m.group(1))
+            if 1 <= day <= 31:
+                result['date'] = f"{day} {month_display}"
+                break
+
+    # --- Service extraction ---
+    for keywords, service_name, price, duration in _SERVICES_MAP:
+        for kw in keywords:
+            if kw in text_l:
+                result['service'] = service_name
+                result['service_price'] = price
+                if duration:
+                    result['service_duration'] = duration
+                break
+        if 'service' in result:
+            break
+
+    return result
+
+
+def _is_booking_confirmed(ai_text: str) -> bool:
+    """Return True if the AI response sounds like a booking confirmation/reservation."""
+    t = ai_text.lower()
+    return any(phrase in t for phrase in _CONFIRMATION_PHRASES)
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -213,6 +293,10 @@ async def ws_voice_endpoint(websocket: WebSocket):
                     continue
 
                 await send({"action": "transcript", "text": transcript})
+                # Extract booking info from user speech and sync UI
+                booking_info = _extract_booking_info(transcript)
+                if booking_info:
+                    await send({"action": "booking_update", **booking_info})
                 await send({"action": "thinking"})
 
                 # 4. Load character system prompt
@@ -266,6 +350,9 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 await send({"action": "response_text", "text": clean_response})
                 await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
                 await send({"action": "done"})
+                # Check if this response contains a booking confirmation
+                if _is_booking_confirmed(clean_response):
+                    await send({"action": "booking_confirmed"})
 
             # ------------------------------------------------------------------
             # "check_in" — browser detected prolonged silence; Sara prompts
@@ -293,6 +380,10 @@ async def ws_voice_endpoint(websocket: WebSocket):
                     continue
 
                 await send({"action": "transcript", "text": user_text})
+                # Extract booking info from selected text and sync UI
+                booking_info = _extract_booking_info(user_text)
+                if booking_info:
+                    await send({"action": "booking_update", **booking_info})
                 await send({"action": "thinking"})
 
                 prompt_path = _character_prompt_path(character)
@@ -329,6 +420,9 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 await send({"action": "response_text", "text": clean_response})
                 await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
                 await send({"action": "done"})
+                # Check if this response contains a booking confirmation
+                if _is_booking_confirmed(clean_response):
+                    await send({"action": "booking_confirmed"})
 
             else:
                 await send({"action": "error", "message": f"Unknown action: {action}"})

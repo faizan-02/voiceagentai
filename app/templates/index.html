@@ -45,6 +45,40 @@
         }
         .header-controls #theme-toggle    { margin-top: 0; }
         .header-controls #download-button { margin-top: 0; }
+
+        /* Clickable service items */
+        .spa-service-item {
+            cursor: pointer;
+            border-radius: 4px;
+            padding: 2px 4px;
+            transition: background 0.15s, color 0.15s;
+        }
+        .spa-service-item:hover { background: var(--primary); color: #fff; opacity: 0.85; }
+        .spa-service-item.selected {
+            background: var(--primary);
+            color: #fff;
+            font-weight: 600;
+            border-radius: 4px;
+            padding: 2px 4px;
+        }
+
+        /* Booking summary card */
+        .booking-summary-card {
+            background: linear-gradient(135deg, rgba(76,222,128,0.1), rgba(124,143,255,0.1));
+            border: 1px solid var(--green);
+            border-radius: 10px;
+            padding: 0.75rem;
+            font-size: 0.85rem;
+        }
+        .booking-summary-card .summary-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 3px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .booking-summary-card .summary-row:last-child { border-bottom: none; }
+        .booking-summary-card .summary-label { color: var(--text-muted); font-weight: 600; }
+        .booking-summary-card .summary-value { color: var(--green); font-weight: 500; }
     </style>
 </head>
 <body class="dark-mode">
@@ -137,38 +171,45 @@
                         <div class="spa-service-card">
                             <h4>Massages</h4>
                             <ul>
-                                <li>Classic Swedish – 60 min – 7,500</li>
-                                <li>Deep Tissue – 60 min – 8,500</li>
-                                <li>Aromatherapy – 90 min – 11,500</li>
+                                <li class="spa-service-item" data-service="Classic Swedish Massage" data-price="7,500 PKR" data-duration="60 min">Classic Swedish – 60 min – 7,500</li>
+                                <li class="spa-service-item" data-service="Deep Tissue Massage" data-price="8,500 PKR" data-duration="60 min">Deep Tissue – 60 min – 8,500</li>
+                                <li class="spa-service-item" data-service="Aromatherapy Massage" data-price="11,500 PKR" data-duration="90 min">Aromatherapy – 90 min – 11,500</li>
                             </ul>
                         </div>
                         <div class="spa-service-card">
                             <h4>Facials</h4>
                             <ul>
-                                <li>Glow Facial – 60 min – 6,000</li>
-                                <li>Hydrating Facial – 75 min – 7,500</li>
-                                <li>Anti‑Aging – 90 min – 9,500</li>
+                                <li class="spa-service-item" data-service="Glow Facial" data-price="6,000 PKR" data-duration="60 min">Glow Facial – 60 min – 6,000</li>
+                                <li class="spa-service-item" data-service="Hydrating Facial" data-price="7,500 PKR" data-duration="75 min">Hydrating Facial – 75 min – 7,500</li>
+                                <li class="spa-service-item" data-service="Anti-Aging Facial" data-price="9,500 PKR" data-duration="90 min">Anti‑Aging – 90 min – 9,500</li>
                             </ul>
                         </div>
                         <div class="spa-service-card">
                             <h4>Hair</h4>
                             <ul>
-                                <li>Cut &amp; Blow‑dry – from 4,000</li>
-                                <li>Root Touch‑up – from 5,500</li>
-                                <li>Full Color – from 8,500</li>
+                                <li class="spa-service-item" data-service="Haircut & Blow-dry" data-price="from 4,000 PKR">Cut &amp; Blow‑dry – from 4,000</li>
+                                <li class="spa-service-item" data-service="Root Touch-up" data-price="from 5,500 PKR">Root Touch‑up – from 5,500</li>
+                                <li class="spa-service-item" data-service="Full Color" data-price="from 8,500 PKR">Full Color – from 8,500</li>
                             </ul>
                         </div>
                         <div class="spa-service-card">
                             <h4>Nails &amp; Packages</h4>
                             <ul>
-                                <li>Manicure – 2,800</li>
-                                <li>Pedicure – 3,200</li>
-                                <li>Relax &amp; Glow – 13,000</li>
-                                <li>Full Pamper Day – 19,500</li>
+                                <li class="spa-service-item" data-service="Classic Manicure" data-price="2,800 PKR">Manicure – 2,800</li>
+                                <li class="spa-service-item" data-service="Classic Pedicure" data-price="3,200 PKR">Pedicure – 3,200</li>
+                                <li class="spa-service-item" data-service="Relax & Glow Package" data-price="13,000 PKR">Relax &amp; Glow – 13,000</li>
+                                <li class="spa-service-item" data-service="Full Pamper Day" data-price="19,500 PKR">Full Pamper Day – 19,500</li>
                             </ul>
                         </div>
                     </div>
-                    <p class="spa-hint">Tell Sara which service, day, and time.</p>
+                    <p class="spa-hint">Tap a service to select it, or tell Sara which one you'd like.</p>
+                </section>
+                <section class="spa-section" id="booking-summary-section" style="display:none;">
+                    <h3>Booking Summary</h3>
+                    <div id="booking-summary-card" class="booking-summary-card">
+                        <div id="booking-summary-content"></div>
+                        <p class="spa-hint">Our team will confirm by call or WhatsApp.</p>
+                    </div>
                 </section>
             </aside>
 

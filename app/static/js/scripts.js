@@ -42,6 +42,9 @@ document.addEventListener("DOMContentLoaded", function() {
     let vadReady              = false; // true once AudioContext has had time to warm up
     const CHECK_IN_MS         = 10000; // ms of silence before "are you still there?"
 
+    // Booking state — synced between voice and UI
+    let bookingDetails = { date: null, service: null, servicePrice: null, serviceDuration: null };
+
     // VAD tuning
     const SILENCE_THRESHOLD   = 15;   // 15/255 — filters noise while catching normal speech
     const SILENCE_DURATION_MS = 1800; // ms of continuous silence before submitting
@@ -186,6 +189,16 @@ document.addEventListener("DOMContentLoaded", function() {
                 if (isConversationActive) {
                     setTimeout(startNextTurn, 1200);
                 }
+                break;
+
+            case "booking_update":
+                // Server extracted date/service from user speech — sync the UI
+                if (data.date)   { bookingDetails.date = data.date; syncCalendarDate(data.date); }
+                if (data.service){ bookingDetails.service = data.service; bookingDetails.servicePrice = data.service_price || null; bookingDetails.serviceDuration = data.service_duration || null; syncServiceSelection(data.service); }
+                break;
+
+            case "booking_confirmed":
+                showBookingSummary();
                 break;
         }
     }
@@ -438,6 +451,10 @@ document.addEventListener("DOMContentLoaded", function() {
         setAgentState('goodbye');
         displayMessage("Conversation ended.", 'goodbye-message');
         setTimeout(() => setAgentState('idle'), 3000);
+        bookingDetails = { date: null, service: null, servicePrice: null, serviceDuration: null };
+        document.querySelectorAll('.spa-service-item').forEach(i => i.classList.remove('selected'));
+        const summarySection = document.getElementById('booking-summary-section');
+        if (summarySection) summarySection.style.display = 'none';
     });
 
     clearButton.addEventListener('click', async function() {
@@ -640,9 +657,47 @@ document.addEventListener("DOMContentLoaded", function() {
         if (selectedCharacter === 'customer_support') {
             sidebar.classList.remove('hidden');
             buildSpaCalendar();
+            setupServiceItemClicks();
         } else {
             sidebar.classList.add('hidden');
         }
+    }
+
+    function setupServiceItemClicks() {
+        document.querySelectorAll('.spa-service-item').forEach(item => {
+            item.addEventListener('click', function() {
+                // Visually select
+                document.querySelectorAll('.spa-service-item').forEach(i => i.classList.remove('selected'));
+                this.classList.add('selected');
+
+                const svc = this.dataset.service;
+                const price = this.dataset.price || '';
+                const duration = this.dataset.duration || '';
+
+                bookingDetails.service = svc;
+                bookingDetails.servicePrice = price;
+                bookingDetails.serviceDuration = duration || null;
+
+                // If conversation is active, notify AI
+                if (isConversationActive && websocket && websocket.readyState === WebSocket.OPEN) {
+                    stopVAD();
+                    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                        mediaRecorder.onstop = () => { audioChunks = []; };
+                        mediaRecorder.stop();
+                    }
+                    clearTimeout(checkInTimer);
+
+                    const msg = duration
+                        ? `I'd like to book the ${svc} (${duration}, ${price}).`
+                        : `I'd like to book the ${svc} (${price}).`;
+                    displayMessage(msg, 'user-message');
+                    hideListeningIndicator();
+                    setAgentState('thinking');
+                    showThinkingIndicator();
+                    websocket.send(JSON.stringify({ action: "text", text: msg }));
+                }
+            });
+        });
     }
 
     function buildSpaCalendar() {
@@ -768,6 +823,57 @@ document.addEventListener("DOMContentLoaded", function() {
             opt.value = 'af_bella'; opt.text = 'Select Kokoro TTS to Load';
             sel.add(opt);
         });
+
+    // ─── Booking UI sync ──────────────────────────────────────────────────────
+
+    function syncCalendarDate(dateStr) {
+        // dateStr format: "20 March" — find the matching day button and click it
+        const parts = dateStr.split(' ');
+        const day = parseInt(parts[0], 10);
+        if (isNaN(day)) return;
+        const cal = document.getElementById('spa-calendar');
+        if (!cal) return;
+        cal.querySelectorAll('.spa-calendar-day').forEach(btn => {
+            btn.classList.remove('selected');
+            if (parseInt(btn.textContent, 10) === day && !btn.disabled) {
+                btn.classList.add('selected');
+                const selectedLabel = document.getElementById('spa-selected-date');
+                if (selectedLabel) selectedLabel.textContent = `Selected: ${dateStr}`;
+                bookingDetails.date = dateStr;
+            }
+        });
+    }
+
+    function syncServiceSelection(serviceName) {
+        // Highlight the matching service item in the sidebar
+        document.querySelectorAll('.spa-service-item').forEach(item => {
+            item.classList.remove('selected');
+            if (item.dataset.service === serviceName) {
+                item.classList.add('selected');
+            }
+        });
+    }
+
+    function showBookingSummary() {
+        const section = document.getElementById('booking-summary-section');
+        const content = document.getElementById('booking-summary-content');
+        if (!section || !content) return;
+
+        const rows = [];
+        if (bookingDetails.date)            rows.push(['Date',    bookingDetails.date]);
+        if (bookingDetails.service)         rows.push(['Service', bookingDetails.service]);
+        if (bookingDetails.servicePrice)    rows.push(['Price',   bookingDetails.servicePrice]);
+        if (bookingDetails.serviceDuration) rows.push(['Duration',bookingDetails.serviceDuration]);
+
+        if (rows.length === 0) return;
+
+        content.innerHTML = rows.map(([label, value]) =>
+            `<div class="summary-row"><span class="summary-label">${label}</span><span class="summary-value">${value}</span></div>`
+        ).join('');
+
+        section.style.display = '';
+        section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
 
     // ─── Init ─────────────────────────────────────────────────────────────────
 
