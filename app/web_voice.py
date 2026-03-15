@@ -100,6 +100,25 @@ def _extract_booking_info(text: str) -> dict:
                 result['date'] = f"{day} {month_display}"
                 break
 
+    # --- Time extraction ---
+    # Match "3 PM", "3:30 PM", "3:30pm", "3pm", "15:00", "15:30"
+    time_m = re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)\b', text_l)
+    if time_m:
+        hour = int(time_m.group(1))
+        mins = time_m.group(2) or '00'
+        period = time_m.group(3).replace('.', '').upper()
+        if 1 <= hour <= 12:
+            result['time'] = f"{hour}:{mins} {period}"
+    else:
+        # 24-hour format "14:00", "15:30"
+        time_m2 = re.search(r'\b(1[0-9]|2[0-3]):([0-5][0-9])\b', text_l)
+        if time_m2:
+            hour = int(time_m2.group(1))
+            mins = time_m2.group(2)
+            period = 'PM' if hour >= 12 else 'AM'
+            disp = hour - 12 if hour > 12 else hour
+            result['time'] = f"{disp}:{mins} {period}"
+
     # --- Service extraction ---
     for keywords, service_name, price, duration in _SERVICES_MAP:
         for kw in keywords:

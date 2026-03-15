@@ -62,6 +62,35 @@
             padding: 2px 4px;
         }
 
+        /* Time picker */
+        .spa-time-picker {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        .spa-time-slot {
+            padding: 5px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            color: var(--text-muted);
+            font-size: 0.78rem;
+            cursor: pointer;
+            transition: all 0.18s ease;
+        }
+        .spa-time-slot:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+            background: rgba(124,143,255,0.08);
+        }
+        .spa-time-slot.selected {
+            background: linear-gradient(135deg, var(--accent), #9b59b6);
+            border-color: transparent;
+            color: #fff;
+            font-weight: 600;
+        }
+
         /* Booking summary card */
         .booking-summary-card {
             background: linear-gradient(135deg, rgba(76,222,128,0.1), rgba(124,143,255,0.1));
@@ -163,6 +192,12 @@
                     <div id="spa-today" class="spa-today"></div>
                     <div id="spa-calendar" class="spa-calendar"></div>
                     <div id="spa-selected-date" class="spa-selected-date">Select a date and tell Sara.</div>
+                </section>
+
+                <section class="spa-section">
+                    <h3>Preferred Time</h3>
+                    <div id="spa-time-picker" class="spa-time-picker"></div>
+                    <div id="spa-selected-time" class="spa-selected-date">Select a time or tell Sara.</div>
                 </section>
 
                 <section class="spa-section">

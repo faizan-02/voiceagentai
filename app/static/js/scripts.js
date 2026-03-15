@@ -43,7 +43,7 @@ document.addEventListener("DOMContentLoaded", function() {
     const CHECK_IN_MS         = 10000; // ms of silence before "are you still there?"
 
     // Booking state — synced between voice and UI
-    let bookingDetails = { date: null, service: null, servicePrice: null, serviceDuration: null };
+    let bookingDetails = { date: null, time: null, service: null, servicePrice: null, serviceDuration: null };
 
     // VAD tuning
     const SILENCE_THRESHOLD   = 15;   // 15/255 — filters noise while catching normal speech
@@ -63,6 +63,11 @@ document.addEventListener("DOMContentLoaded", function() {
 
     function setAgentState(state) {
         agentState = state;
+        // Suppress check-in timer while AI is thinking or speaking
+        if (state === 'thinking' || state === 'speaking') {
+            clearTimeout(checkInTimer);
+            checkInTimer = null;
+        }
         updateStatusBar();
         updateButtonStates();
         updateMicIcon();
@@ -192,9 +197,10 @@ document.addEventListener("DOMContentLoaded", function() {
                 break;
 
             case "booking_update":
-                // Server extracted date/service from user speech — sync the UI
-                if (data.date)   { bookingDetails.date = data.date; syncCalendarDate(data.date); }
-                if (data.service){ bookingDetails.service = data.service; bookingDetails.servicePrice = data.service_price || null; bookingDetails.serviceDuration = data.service_duration || null; syncServiceSelection(data.service); }
+                // Server extracted date/service/time from user speech — sync the UI
+                if (data.date)    { bookingDetails.date = data.date; syncCalendarDate(data.date); }
+                if (data.service) { bookingDetails.service = data.service; bookingDetails.servicePrice = data.service_price || null; bookingDetails.serviceDuration = data.service_duration || null; syncServiceSelection(data.service); }
+                if (data.time)    { bookingDetails.time = data.time; syncTimeSelection(data.time); }
                 break;
 
             case "booking_confirmed":
@@ -267,6 +273,9 @@ document.addEventListener("DOMContentLoaded", function() {
 
         // VAD polling every 100ms
         vadTimer = setInterval(checkVAD, 100);
+
+        // Start silence check-in timer from the moment we begin listening
+        if (vadReady) resetCheckInTimer();
     }
 
     // ─── Check-in timer (independent of VAD) ─────────────────────────────────
@@ -279,7 +288,9 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function fireCheckIn() {
-        if (!isConversationActive || !websocket || websocket.readyState !== WebSocket.OPEN) return;
+        // Only fire when truly idle-listening — never interrupt AI speaking/thinking
+        if (!isConversationActive || agentState !== 'listening') return;
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
         stopVAD();
         if (mediaRecorder && mediaRecorder.state !== 'inactive') {
             mediaRecorder.onstop = () => {
@@ -327,8 +338,6 @@ document.addEventListener("DOMContentLoaded", function() {
 
         mediaRecorder.onstop = async () => {
             if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
-                // Confirmed speech — reset check-in timer and send audio
-                resetCheckInTimer();
                 const blob     = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
                 const arrayBuf = await blob.arrayBuffer();
                 const base64   = arrayBufferToBase64(arrayBuf);
@@ -394,7 +403,6 @@ document.addEventListener("DOMContentLoaded", function() {
             URL.revokeObjectURL(url);
             currentAudio = null;
             hideVoiceAnimation();
-            resetCheckInTimer(); // restart 10s silence clock after AI finishes speaking
             startNextTurn();
         };
 
@@ -425,11 +433,12 @@ document.addEventListener("DOMContentLoaded", function() {
         vadReady = false;
         setAgentState('listening');
         connectWebSocket();
-        // Delay check-in timer by 2s: covers WebSocket connection + AudioContext warmup
-        // so the user gets a full 10s window of actual working speech detection
+        // Delay VAD readiness by 2s to cover AudioContext warmup.
+        // Timer starts in startRecording once vadReady=true.
         setTimeout(() => {
             vadReady = true;
-            resetCheckInTimer();
+            // If we're already in listening state, kick off the check-in timer now
+            if (isConversationActive && agentState === 'listening') resetCheckInTimer();
         }, 2000);
     });
 
@@ -451,8 +460,9 @@ document.addEventListener("DOMContentLoaded", function() {
         setAgentState('goodbye');
         displayMessage("Conversation ended.", 'goodbye-message');
         setTimeout(() => setAgentState('idle'), 3000);
-        bookingDetails = { date: null, service: null, servicePrice: null, serviceDuration: null };
+        bookingDetails = { date: null, time: null, service: null, servicePrice: null, serviceDuration: null };
         document.querySelectorAll('.spa-service-item').forEach(i => i.classList.remove('selected'));
+        document.querySelectorAll('.spa-time-slot').forEach(i => i.classList.remove('selected'));
         const summarySection = document.getElementById('booking-summary-section');
         if (summarySection) summarySection.style.display = 'none';
     });
@@ -657,10 +667,67 @@ document.addEventListener("DOMContentLoaded", function() {
         if (selectedCharacter === 'customer_support') {
             sidebar.classList.remove('hidden');
             buildSpaCalendar();
+            buildSpaTimePicker();
             setupServiceItemClicks();
         } else {
             sidebar.classList.add('hidden');
         }
+    }
+
+    function buildSpaTimePicker() {
+        const container = document.getElementById('spa-time-picker');
+        if (!container) return;
+        container.innerHTML = '';
+
+        // Spa operating hours: 10 AM – 7 PM, hourly slots
+        const slots = [
+            '10:00 AM', '11:00 AM', '12:00 PM',
+            '1:00 PM',  '2:00 PM',  '3:00 PM',
+            '4:00 PM',  '5:00 PM',  '6:00 PM', '7:00 PM'
+        ];
+
+        slots.forEach(slot => {
+            const btn = document.createElement('button');
+            btn.className = 'spa-time-slot';
+            btn.textContent = slot;
+            btn.dataset.time = slot;
+            btn.addEventListener('click', () => {
+                container.querySelectorAll('.spa-time-slot').forEach(b => b.classList.remove('selected'));
+                btn.classList.add('selected');
+                const selectedTimeLabel = document.getElementById('spa-selected-time');
+                if (selectedTimeLabel) selectedTimeLabel.textContent = `Selected: ${slot}`;
+                bookingDetails.time = slot;
+
+                if (isConversationActive && websocket && websocket.readyState === WebSocket.OPEN) {
+                    stopVAD();
+                    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                        mediaRecorder.onstop = () => { audioChunks = []; };
+                        mediaRecorder.stop();
+                    }
+                    clearTimeout(checkInTimer);
+                    const msg = `I'd prefer ${slot} for my appointment.`;
+                    displayMessage(msg, 'user-message');
+                    hideListeningIndicator();
+                    setAgentState('thinking');
+                    showThinkingIndicator();
+                    websocket.send(JSON.stringify({ action: "text", text: msg }));
+                }
+            });
+            container.appendChild(btn);
+        });
+    }
+
+    function syncTimeSelection(timeStr) {
+        // Highlight the matching time slot button
+        document.querySelectorAll('.spa-time-slot').forEach(btn => {
+            btn.classList.remove('selected');
+            if (btn.dataset.time === timeStr) {
+                btn.classList.add('selected');
+                const label = document.getElementById('spa-selected-time');
+                if (label) label.textContent = `Selected: ${timeStr}`;
+                bookingDetails.time = timeStr;
+            }
+        });
     }
 
     function setupServiceItemClicks() {
@@ -860,10 +927,11 @@ document.addEventListener("DOMContentLoaded", function() {
         if (!section || !content) return;
 
         const rows = [];
-        if (bookingDetails.date)            rows.push(['Date',    bookingDetails.date]);
-        if (bookingDetails.service)         rows.push(['Service', bookingDetails.service]);
-        if (bookingDetails.servicePrice)    rows.push(['Price',   bookingDetails.servicePrice]);
-        if (bookingDetails.serviceDuration) rows.push(['Duration',bookingDetails.serviceDuration]);
+        if (bookingDetails.date)            rows.push(['Date',     bookingDetails.date]);
+        if (bookingDetails.time)            rows.push(['Time',     bookingDetails.time]);
+        if (bookingDetails.service)         rows.push(['Service',  bookingDetails.service]);
+        if (bookingDetails.servicePrice)    rows.push(['Price',    bookingDetails.servicePrice]);
+        if (bookingDetails.serviceDuration) rows.push(['Duration', bookingDetails.serviceDuration]);
 
         if (rows.length === 0) return;
 
