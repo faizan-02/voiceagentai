@@ -1,623 +1,452 @@
+/**
+ * enhanced.js — browser-based voice chat using /ws_voice
+ * Same MediaRecorder + VAD approach as scripts.js, with enhanced settings.
+ */
 document.addEventListener("DOMContentLoaded", function() {
-    let websocket;
-    let reconnectAttempts = 0;
-    const maxReconnectAttempts = 5;
-    const reconnectDelay = 2000; // 2 seconds
-    
-    const micIcon = document.getElementById('mic-icon');
-    const themeToggle = document.getElementById('theme-toggle');
-    const downloadButton = document.getElementById('download-button');
-    const conversation = document.getElementById('conversation');
-    const startBtn = document.getElementById('startBtn');
-    const stopBtn = document.getElementById('stopBtn');
-    const clearBtn = document.getElementById('clearBtn');
-    const characterSelect = document.getElementById('characterSelect');
-    const voiceSelect = document.getElementById('voiceSelect');
-    const modelSelect = document.getElementById('modelSelect');
-    const ttsModelSelect = document.getElementById('ttsModelSelect');
-    const transcriptionModelSelect = document.getElementById('transcriptionModelSelect');
 
-    // Default speed value (since we removed the speedSelect dropdown)
-    const defaultSpeed = "1.0";
+    // ── DOM refs ──────────────────────────────────────────────────────────────
+    const micIcon              = document.getElementById('mic-icon');
+    const themeToggle          = document.getElementById('theme-toggle');
+    const downloadButton       = document.getElementById('download-button');
+    const conversation         = document.getElementById('conversation');
+    const messagesDiv          = document.getElementById('messages');
+    const startBtn             = document.getElementById('startBtn');
+    const stopBtn              = document.getElementById('stopBtn');
+    const clearBtn             = document.getElementById('clearBtn');
+    const characterSelect      = document.getElementById('characterSelect');
+    const voiceSelect          = document.getElementById('voiceSelect');
+    const modelSelect          = document.getElementById('modelSelect');
+    const statusBar            = document.getElementById('status-bar-enhanced');
 
-    let isRecording = false;
-    let hasStarted = false;
-    let listeningIndicator = null;
-    
-    // For message queue management (like the main page)
-    let aiMessageQueue = [];
-    let isAISpeaking = false;
-    
+    // ── State ─────────────────────────────────────────────────────────────────
+    let websocket              = null;
+    let mediaStream            = null;
+    let mediaRecorder          = null;
+    let audioChunks            = [];
+    let audioContext           = null;
+    let analyser               = null;
+    let vadTimer               = null;
+    let isConversationActive   = false;
+    let currentAudio           = null;
+    let audioResponseReceived  = false;
+    let noSpeechCycles         = 0;
+    const NO_SPEECH_CHECKIN    = 2;
+
+    // VAD tuning (same as scripts.js)
+    const SILENCE_THRESHOLD    = 8;
+    const SILENCE_DURATION_MS  = 1800;
+    const MIN_SPEECH_CHUNKS    = 2;
+    const MAX_RECORD_MS        = 12000;
+    let silenceStart   = null;
+    let speechChunks   = 0;
+    let hasSpeech      = false;
+    let recordingStart = null;
+
+    // ── Agent state ───────────────────────────────────────────────────────────
+
+    function setStatus(state) {
+        if (!statusBar) return;
+        const icons  = { idle: '○', listening: '◉', thinking: '◌', speaking: '▶', goodbye: '✓' };
+        const labels = {
+            idle:      'Ready — press Start to begin',
+            listening: 'Listening…',
+            thinking:  'Thinking…',
+            speaking:  'Speaking…',
+            goodbye:   'Conversation ended'
+        };
+        statusBar.className = 'status-bar status-' + state;
+        statusBar.innerHTML =
+            `<span class="status-dot">${icons[state] || '○'}</span>` +
+            `<span class="status-label">${labels[state] || ''}</span>`;
+
+        // Mic icon
+        micIcon.classList.remove('mic-on', 'mic-off', 'mic-waiting', 'pulse-animation');
+        if      (state === 'listening') micIcon.classList.add('mic-on', 'pulse-animation');
+        else if (state === 'thinking')  micIcon.classList.add('mic-waiting');
+        else if (state === 'speaking')  micIcon.classList.add('mic-on');
+        else                            micIcon.classList.add('mic-off');
+
+        // Buttons
+        const active = (state !== 'idle' && state !== 'goodbye');
+        startBtn.disabled = active;
+        stopBtn.disabled  = !active;
+    }
+
+    // ── WebSocket ─────────────────────────────────────────────────────────────
+
     function connectWebSocket() {
-        // Close existing connection if any
-        if (websocket && websocket.readyState !== WebSocket.CLOSED) {
+        const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        websocket = new WebSocket(`${wsProto}://${window.location.host}/ws_voice`);
+
+        websocket.onopen = function() {
+            websocket.send(JSON.stringify({
+                action:    "start",
+                character: characterSelect.value,
+                model:     modelSelect.value,
+                voice:     voiceSelect.value
+            }));
+        };
+
+        websocket.onclose = function() {
+            stopVAD();
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+            if (isConversationActive) { isConversationActive = false; setStatus('idle'); }
+        };
+
+        websocket.onerror = function() {
+            displayMessage("Connection error. Please try again.", 'error-message');
+            isConversationActive = false;
+            setStatus('idle');
+        };
+
+        websocket.onmessage = handleMessage;
+    }
+
+    function handleMessage(event) {
+        let data;
+        try { data = JSON.parse(event.data); }
+        catch (e) { return; }
+
+        switch (data.action) {
+            case "listening":
+                setStatus('listening');
+                hideThinking();
+                hideVoiceAnim();
+                showListening();
+                audioResponseReceived = false;
+                startRecording();
+                break;
+            case "transcript":
+                hideListening();
+                if (data.text) displayMessage(data.text, 'user-message');
+                break;
+            case "thinking":
+                setStatus('thinking');
+                hideListening();
+                showThinking();
+                break;
+            case "response_text":
+                hideThinking();
+                if (data.text) displayMessage(data.text, 'ai-message');
+                break;
+            case "audio_response":
+                audioResponseReceived = true;
+                setStatus('speaking');
+                showVoiceAnim();
+                playAudio(data.data, data.format || 'mp3');
+                break;
+            case "done":
+                if (!audioResponseReceived) nextTurn();
+                break;
+            case "error":
+                displayMessage(data.message || "Error occurred.", 'error-message');
+                hideThinking(); hideListening(); hideVoiceAnim();
+                if (isConversationActive) setTimeout(nextTurn, 1200);
+                break;
+        }
+    }
+
+    function nextTurn() {
+        if (!isConversationActive || !websocket || websocket.readyState !== WebSocket.OPEN) return;
+        audioResponseReceived = false;
+        setStatus('listening');
+        showListening();
+        startRecording();
+    }
+
+    // ── Microphone ────────────────────────────────────────────────────────────
+
+    async function initMic() {
+        try {
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const src = audioContext.createMediaStreamSource(mediaStream);
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 512;
+            src.connect(analyser);
+            return true;
+        } catch (e) {
+            displayMessage("Microphone access denied.", 'error-message');
+            return false;
+        }
+    }
+
+    // ── Recording + VAD ───────────────────────────────────────────────────────
+
+    function getMimeType() {
+        const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', ''];
+        for (const t of types) { if (!t || MediaRecorder.isTypeSupported(t)) return t; }
+        return '';
+    }
+
+    function startRecording() {
+        if (!mediaStream || !isConversationActive) return;
+        audioChunks    = [];
+        hasSpeech      = false;
+        silenceStart   = null;
+        speechChunks   = 0;
+        recordingStart = Date.now();
+
+        const mt = getMimeType();
+        try { mediaRecorder = new MediaRecorder(mediaStream, mt ? { mimeType: mt } : {}); }
+        catch (_) { mediaRecorder = new MediaRecorder(mediaStream); }
+
+        mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+        mediaRecorder.start(100);
+        vadTimer = setInterval(checkVAD, 100);
+    }
+
+    function checkVAD() {
+        if (!analyser || !isConversationActive) return;
+        const buf = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i];
+        const avg = sum / buf.length;
+        const now = Date.now();
+
+        if (now - recordingStart > MAX_RECORD_MS) { submitRecording(); return; }
+
+        if (avg > SILENCE_THRESHOLD) {
+            silenceStart = null; hasSpeech = true; speechChunks++;
+        } else if (hasSpeech) {
+            if (!silenceStart) silenceStart = now;
+            if (now - silenceStart > SILENCE_DURATION_MS) submitRecording();
+        }
+    }
+
+    function submitRecording() {
+        stopVAD();
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+
+        mediaRecorder.onstop = async () => {
+            if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
+                noSpeechCycles = 0;
+                const blob   = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                const ab     = await blob.arrayBuffer();
+                const b64    = arrayBufferToBase64(ab);
+                audioChunks  = [];
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    hideListening();
+                    setStatus('thinking');
+                    showThinking();
+                    websocket.send(JSON.stringify({ action: "audio", data: b64 }));
+                }
+            } else {
+                audioChunks = [];
+                noSpeechCycles++;
+                if (noSpeechCycles >= NO_SPEECH_CHECKIN && isConversationActive &&
+                    websocket && websocket.readyState === WebSocket.OPEN) {
+                    noSpeechCycles = 0;
+                    websocket.send(JSON.stringify({ action: "check_in" }));
+                } else if (isConversationActive) {
+                    nextTurn();
+                }
+            }
+        };
+        mediaRecorder.stop();
+    }
+
+    function stopVAD() { if (vadTimer) { clearInterval(vadTimer); vadTimer = null; } }
+
+    function stopRecording() {
+        stopVAD();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.ondataavailable = null;
+            mediaRecorder.onstop = null;
+            try { mediaRecorder.stop(); } catch (_) {}
+        }
+        audioChunks = [];
+    }
+
+    function arrayBufferToBase64(buf) {
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        const chunk = 8192;
+        for (let i = 0; i < bytes.length; i += chunk)
+            bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+        return btoa(bin);
+    }
+
+    // ── Playback ──────────────────────────────────────────────────────────────
+
+    function playAudio(b64, format) {
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        const str   = atob(b64);
+        const bytes = new Uint8Array(str.length);
+        for (let i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i);
+        const blob  = new Blob([bytes], { type: format === 'mp3' ? 'audio/mpeg' : `audio/${format}` });
+        const url   = URL.createObjectURL(blob);
+        currentAudio = new Audio(url);
+
+        currentAudio.onended = () => {
+            URL.revokeObjectURL(url); currentAudio = null;
+            hideVoiceAnim(); nextTurn();
+        };
+        currentAudio.onerror = () => {
+            URL.revokeObjectURL(url); currentAudio = null;
+            hideVoiceAnim(); nextTurn();
+        };
+        currentAudio.play().catch(() => { hideVoiceAnim(); nextTurn(); });
+    }
+
+    // ── Buttons ───────────────────────────────────────────────────────────────
+
+    startBtn.addEventListener('click', async function() {
+        if (isConversationActive) return;
+        const ok = await initMic();
+        if (!ok) return;
+        isConversationActive = true;
+        noSpeechCycles = 0;
+        setStatus('listening');
+        connectWebSocket();
+    });
+
+    stopBtn.addEventListener('click', function() {
+        isConversationActive = false;
+        stopVAD(); stopRecording();
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            try { websocket.send(JSON.stringify({ action: "stop" })); } catch (_) {}
             websocket.close();
         }
-        
-        const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        websocket = new WebSocket(`${wsProto}://${window.location.host}/ws_enhanced`);
-        
-        websocket.onopen = function(event) {
-            console.log("WebSocket connection established");
-            startBtn.disabled = false;
-            reconnectAttempts = 0; // Reset reconnect counter on successful connection
-            displayMessage("Connected to server", "system-message");
-        };
-        
-        websocket.onmessage = function(event) {
-            let data;
-            
-            // First check if the data is already a string that should be displayed directly
-            if (typeof event.data === 'string' && !event.data.startsWith('{') && !event.data.startsWith('[')) {
-                displayMessage(event.data);
-                return;
-            }
-            
-            // Try to parse as JSON
-            try {
-                data = JSON.parse(event.data);
-                console.log("Received message:", data);
-            } catch (e) {
-                console.log("Received non-JSON message:", event.data);
-                // Don't treat this as an error if it's just a plain text message
-                if (event.data && typeof event.data === 'string') {
-                    displayMessage(event.data);
-                    return;
-                }
-                console.error("Error parsing WebSocket message:", e);
-                data = { message: event.data, action: "error" };
-            }
-            
-            if (data.action === "waiting_for_speech") {
-                isRecording = false;
-                micIcon.classList.remove('mic-on');
-                micIcon.classList.add('mic-waiting');
-                // Show listening message with animation
-                showListeningIndicator("Listening");
-            } else if (data.action === "recording_started") {
-                isRecording = true;
-                micIcon.classList.remove('mic-off', 'mic-waiting');
-                micIcon.classList.add('mic-on');
-                micIcon.classList.add('pulse-animation');
-                hideListeningIndicator();
-            } else if (data.action === "recording_stopped") {
-                isRecording = false;
-                micIcon.classList.remove('mic-on', 'mic-waiting', 'pulse-animation');
-                micIcon.classList.add('mic-off');
-                hideListeningIndicator();
-            } else if (data.action === "audio_actually_playing") {
-                // Set speaking flag and show animation
-                isAISpeaking = true;
-                showVoiceWaveAnimation();
-                // Process any queued messages after a slight delay
-                setTimeout(processQueuedMessages, 100);
-            } else if (data.action === "ai_start_speaking") {
-                // The server is preparing to speak, but audio hasn't started yet
-                console.log("AI preparing to speak");
-            } else if (data.action === "ai_stop_speaking") {
-                // Audio finished playing
-                isAISpeaking = false;
-                hideVoiceWaveAnimation();
-                // Process any queued messages
-                processQueuedMessages();
-            } else if (data.action === "conversation_stopped") {
-                hasStarted = false;
-                stopBtn.disabled = true;
-                startBtn.disabled = false;
-                micIcon.classList.remove('mic-on', 'mic-waiting', 'pulse-animation');
-                micIcon.classList.add('mic-off');
-                hideListeningIndicator();
-                hideVoiceWaveAnimation();
-                isAISpeaking = false;
-                processQueuedMessages(); // Process any remaining messages
-                console.log("Conversation stopped");
-            } else if (data.action === "clear_character_switch") {
-                // Clear the conversation messages when switching characters
-                const messagesContainer = document.getElementById('messages');
-                messagesContainer.innerHTML = '';
-                console.log("Cleared conversation due to character switch");
-                
-                // Display the character switch message if provided
-                if (data.message) {
-                    displayMessage(data.message, data.type || "system-message");
-                }
-            } else if (data.action === "error") {
-                console.error("Error:", data.message);
-                displayMessage(data.message, "error-message");
-                // Reset mic icon on error
-                micIcon.classList.remove('mic-on', 'mic-waiting', 'pulse-animation');
-                micIcon.classList.add('mic-off');
-                hideListeningIndicator();
-                hideVoiceWaveAnimation();
-                isAISpeaking = false;
-                processQueuedMessages(); // Process any remaining messages
-            } else if (data.action === "connected") {
-                console.log("WebSocket connection confirmed by server");
-            } else if (data.message) {
-                if (data.message.startsWith("You:")) {
-                    // User messages are displayed immediately
-                    displayMessage(data.message);
-                } else if (data.type === "system-message") {
-                    // System messages like character selection are displayed with system styling
-                    displayMessage(data.message, "system-message");
-                } else {
-                    // AI messages - queue to display after audio completes
-                    // Instead of displaying immediately, add to queue and wait for audio to finish
-                    console.log("Queueing AI message for display after audio");
-                    aiMessageQueue.push(data.message);
-                    if (!isAISpeaking) {
-                        processQueuedMessages();
-                    }
-                }
-            }
-        };
-        
-        websocket.onclose = function(event) {
-            console.log("WebSocket connection closed", event);
-            startBtn.disabled = true;
-            stopBtn.disabled = true;
-            
-            // Reset mic icon on disconnect
-            micIcon.classList.remove('mic-on', 'mic-waiting', 'pulse-animation');
-            micIcon.classList.add('mic-off');
-            hideListeningIndicator();
-            hideVoiceWaveAnimation(); // Hide voice animation on disconnect
-            
-            // Try to reconnect if not closed cleanly and not exceeding max attempts
-            if (!event.wasClean && reconnectAttempts < maxReconnectAttempts) {
-                reconnectAttempts++;
-                const delay = reconnectDelay * reconnectAttempts;
-                console.log(`Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts}) in ${delay}ms...`);
-                displayMessage(`Connection lost. Reconnecting (${reconnectAttempts}/${maxReconnectAttempts})...`, "system-message");
-                setTimeout(connectWebSocket, delay);
-            } else if (reconnectAttempts >= maxReconnectAttempts) {
-                displayMessage("Failed to connect to server after multiple attempts. Please refresh the page.", "error-message");
-            }
-        };
-        
-        websocket.onerror = function(event) {
-            console.error("WebSocket error:", event);
-            displayMessage("Connection error. Please try again later.", "error-message");
-            
-            // Reset mic icon on error
-            micIcon.classList.remove('mic-on', 'mic-waiting', 'pulse-animation');
-            micIcon.classList.add('mic-off');
-            hideListeningIndicator();
-            hideVoiceWaveAnimation(); // Hide voice animation on error
-        };
-    }
-    
-    function processQueuedMessages() {
-        while (aiMessageQueue.length > 0 && !isAISpeaking) {
-            displayMessage(aiMessageQueue.shift());
-        }
-    }
-    
-    function displayMessage(message, className = "") {
-        // Only log errors, not regular messages
-        
-        const messagesContainer = document.getElementById('messages');
-        const messageElement = document.createElement("div");
-        
-        if (className) {
-            messageElement.className = className;
-        } else if (message.startsWith("You:")) {
-            messageElement.className = "user-message";
-            message = message.substring(4).trim();
-        } else {
-            messageElement.className = "ai-message";
-        }
-        
-        // Handle newlines in the message
-        if (message.includes('\n')) {
-            message.split('\n').forEach((line, index) => {
-                if (index > 0) {
-                    messageElement.appendChild(document.createElement('br'));
-                }
-                messageElement.appendChild(document.createTextNode(line));
-            });
-        } else {
-            messageElement.textContent = message;
-        }
-        
-        messagesContainer.appendChild(messageElement);
-        conversation.scrollTop = conversation.scrollHeight;
-        adjustScrollPosition();
-    }
-    
-    function adjustScrollPosition() {
-        // Ensure the conversation is scrolled down even with voice animation
-        setTimeout(() => {
-            const height = conversation.scrollHeight;
-            if (isAISpeaking) {
-                // Leave more space when speaking to show animation
-                conversation.scrollTop = height - 250;
-            } else {
-                // Leave a bit of space when not speaking
-                conversation.scrollTop = height - 100;
-            }
-        }, 10);
-    }
-    
-    function showListeningIndicator(message) {
-        hideListeningIndicator(); // Remove any existing indicator
-        
-        const messagesContainer = document.getElementById('messages');
-        listeningIndicator = document.createElement("div");
-        listeningIndicator.className = "listening-indicator";
-        
-        const textSpan = document.createElement("span");
-        textSpan.textContent = message;
-        
-        const dotsContainer = document.createElement("span");
-        dotsContainer.className = "listening-dots";
-        
-        for (let i = 0; i < 3; i++) {
-            const dot = document.createElement("span");
-            dot.className = "dot";
-            dot.style.animationDelay = `${i * 0.3}s`;
-            dotsContainer.appendChild(dot);
-        }
-        
-        listeningIndicator.appendChild(textSpan);
-        listeningIndicator.appendChild(dotsContainer);
-        
-        messagesContainer.appendChild(listeningIndicator);
-        conversation.scrollTop = conversation.scrollHeight;
-    }
-    
-    function hideListeningIndicator() {
-        if (listeningIndicator && listeningIndicator.parentNode) {
-            listeningIndicator.parentNode.removeChild(listeningIndicator);
-            listeningIndicator = null;
-        }
-    }
-    
-    function showVoiceWaveAnimation() {
-        const voiceWave = document.getElementById('voiceWaveAnimation');
-        if (voiceWave) {
-            voiceWave.classList.remove('hidden');
-            adjustScrollPosition();
-        }
-    }
-    
-    function hideVoiceWaveAnimation() {
-        const voiceWave = document.getElementById('voiceWaveAnimation');
-        if (voiceWave) {
-            voiceWave.classList.add('hidden');
-            // Small delay before adjusting scroll
-            setTimeout(() => adjustScrollPosition(), 100);
-        }
-    }
-    
-    startBtn.addEventListener('click', function() {
-        // Check if WebSocket is connected
-        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
-            displayMessage("Not connected to server. Attempting to reconnect...", "system-message");
-            connectWebSocket();
-            return;
-        }
-        
-        // Disable start button and enable stop button
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-        hasStarted = true;
-        
-        // Clear any previous state
-        micIcon.classList.remove('mic-on', 'mic-waiting', 'pulse-animation');
-        micIcon.classList.add('mic-off'); // Will be updated by the server
-        
-        // Get all the selected settings
-        const settings = {
-            character: characterSelect.value,
-            voice: voiceSelect.value,
-            speed: defaultSpeed,
-            model: modelSelect.value,
-            ttsModel: ttsModelSelect.value,
-            transcriptionModel: transcriptionModelSelect.value
-        };
-        
-        // Don't display starting message - keep UI cleaner
-        console.log("Starting enhanced conversation with settings:", settings);
-        
-        // Send the start command with settings
-        fetch('/start_enhanced_conversation', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(settings)
-        })
-        .then(response => response.json())
-        .then(data => {
-            console.log("Start conversation response:", data);
-        })
-        .catch(error => {
-            console.error("Error starting conversation:", error);
-            displayMessage("Error starting conversation. The server may be unresponsive.", "error-message");
-            // Reset buttons on error
-            startBtn.disabled = false;
-            stopBtn.disabled = true;
-            hasStarted = false;
-        });
+        if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        hideListening(); hideThinking(); hideVoiceAnim();
+        setStatus('goodbye');
+        displayMessage("Conversation ended.", 'goodbye-message');
+        setTimeout(() => setStatus('idle'), 3000);
     });
-    
-    stopBtn.addEventListener('click', function() {
-        // Disable stop button and enable start button
-        stopBtn.disabled = true;
-        startBtn.disabled = false;
-        
-        console.log("Stopping enhanced conversation");
-        
-        // Send the stop command
-        fetch('/stop_enhanced_conversation', {
-            method: 'POST'
-        })
-        .then(response => response.json())
-        .then(data => {
-            console.log("Stop conversation response:", data);
-            hasStarted = false;
-        })
-        .catch(error => {
-            console.error("Error stopping conversation:", error);
-            displayMessage("Error stopping conversation. The server may be unresponsive.", "error-message");
-            // Still enable start button even if error
-            startBtn.disabled = false;
-        });
-    });
-    
+
     clearBtn.addEventListener('click', function() {
-        // Clear the conversation by emptying the messages div 
-        // (don't remove the div itself)
-        const messagesContainer = document.getElementById('messages');
-        messagesContainer.innerHTML = '';
-        
-        console.log("Clearing conversation");
-        
-        // Send clear command to the server
-        fetch('/clear_history', {
-            method: 'POST'
-        })
-        .then(response => response.json())
-        .then(data => {
-            console.log("Clear conversation response:", data);
-            // Display a confirmation message
-            displayMessage("Conversation history has been cleared.", "system-message");
-        })
-        .catch(error => {
-            console.error("Error clearing conversation:", error);
-            displayMessage("Error clearing conversation history", "error-message");
-        });
+        messagesDiv.innerHTML = '';
+        fetch('/clear_history', { method: 'POST' }).catch(() => {});
+        displayMessage("Conversation cleared.", 'system-message');
     });
-    
-    // Update theme toggle functionality
-    function updateThemeToggleIcon() {
-        const isDarkMode = document.body.classList.contains('dark-mode');
-        themeToggle.innerHTML = isDarkMode 
-            ? '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-sun"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>'
-            : '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-moon"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>';
+
+    // ── Indicators ────────────────────────────────────────────────────────────
+
+    function showListening() {
+        hideListening();
+        const el = document.createElement('div');
+        el.id = 'listening-indicator'; el.className = 'listening-indicator';
+        el.innerHTML = 'Listening <div class="listening-dots">' +
+            '<div class="dot"></div>' +
+            '<div class="dot" style="animation-delay:0.2s"></div>' +
+            '<div class="dot" style="animation-delay:0.4s"></div></div>';
+        messagesDiv.appendChild(el);
+        conversation.scrollTop = conversation.scrollHeight;
     }
-    
-    themeToggle.addEventListener('click', function() {
-        document.body.classList.toggle('dark-mode');
-        updateThemeToggleIcon();
-        localStorage.setItem('darkMode', document.body.classList.contains('dark-mode'));
-    });
-    
-    // Load theme preference
-    function loadThemePreference() {
-        const isDarkMode = localStorage.getItem('darkMode') === 'true';
-        document.body.classList.toggle('dark-mode', isDarkMode);
-        updateThemeToggleIcon();
+    function hideListening() { const e = document.getElementById('listening-indicator'); if (e) e.remove(); }
+
+    function showThinking() {
+        hideThinking();
+        const el = document.createElement('div');
+        el.id = 'thinking-indicator'; el.className = 'thinking-indicator';
+        el.innerHTML = 'Thinking <div class="thinking-dots">' +
+            '<div class="dot"></div>' +
+            '<div class="dot" style="animation-delay:0.2s"></div>' +
+            '<div class="dot" style="animation-delay:0.4s"></div></div>';
+        messagesDiv.appendChild(el);
+        conversation.scrollTop = conversation.scrollHeight;
+    }
+    function hideThinking() { const e = document.getElementById('thinking-indicator'); if (e) e.remove(); }
+
+    function showVoiceAnim() {
+        const v = document.getElementById('voiceWaveAnimation');
+        if (v) v.classList.remove('hidden');
+        conversation.scrollTop = conversation.scrollHeight;
+    }
+    function hideVoiceAnim() {
+        const v = document.getElementById('voiceWaveAnimation');
+        if (v) v.classList.add('hidden');
     }
 
-    function setDarkModeDefault() {
-        const isDarkMode = localStorage.getItem('darkMode');
-        if (isDarkMode === null) {
-            document.body.classList.add('dark-mode');
+    // ── Messages ──────────────────────────────────────────────────────────────
+
+    function displayMessage(text, className) {
+        text = String(text).replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+        if (!text) return;
+        const el = document.createElement('div');
+        if (className) {
+            el.className = className;
+        } else if (text.startsWith('You:')) {
+            el.className = 'user-message';
+            text = text.replace('You:', '').trim();
         } else {
-            document.body.classList.toggle('dark-mode', isDarkMode === 'true');
+            el.className = 'ai-message';
         }
-        updateThemeToggleIcon();
-    }
-    
-    // Download conversation history
-    downloadButton.addEventListener('click', function() {
-        fetch('/download_enhanced_history')
-            .then(response => {
-                if (response.ok) {
-                    return response.blob();
-                }
-                throw new Error('Failed to download history');
-            })
-            .then(blob => {
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'conversation_history.txt';
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-            })
-            .catch(error => {
-                console.error('Error downloading history:', error);
-                displayMessage("Failed to download conversation history", "error-message");
+        if (text.includes('\n')) {
+            text.split('\n').forEach((line, i) => {
+                if (i > 0) el.appendChild(document.createElement('br'));
+                el.appendChild(document.createTextNode(line));
             });
-    });
-    
-    // Fetch available characters
-    function fetchCharacters() {
-        fetch('/characters')
-            .then(response => response.json())
-            .then(data => {
-                characterSelect.innerHTML = '';
-                
-                // Sort the characters alphabetically
-                data.characters.sort((a, b) => a.localeCompare(b));
-                
-                data.characters.forEach(character => {
-                    const option = document.createElement('option');
-                    option.value = character;
-                    option.textContent = character.replace(/_/g, ' '); // Replace all underscores with spaces
-                    characterSelect.appendChild(option);
-                });
-            })
-            .catch(error => {
-                console.error('Error fetching characters:', error);
-                displayMessage("Failed to load characters", "error-message");
+        } else {
+            el.textContent = text;
+        }
+        messagesDiv.appendChild(el);
+        setTimeout(() => { conversation.scrollTop = conversation.scrollHeight; }, 10);
+    }
+
+    // ── Characters ────────────────────────────────────────────────────────────
+
+    fetch('/characters')
+        .then(r => r.json())
+        .then(data => {
+            characterSelect.innerHTML = '';
+            (data.characters || []).sort((a, b) => a.localeCompare(b)).forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c; opt.textContent = c.replace(/_/g, ' ');
+                characterSelect.appendChild(opt);
             });
-    }
-    
-    // Fetch default settings from server
-    function fetchDefaultSettings() {
-        fetch('/enhanced_defaults')
-            .then(response => response.json())
-            .then(data => {
-                // Wait a moment to ensure the character dropdown is populated
-                setTimeout(() => {
-                    // Set default character
-                    if (data.character && characterSelect.querySelector(`option[value="${data.character}"]`)) {
-                        characterSelect.value = data.character;
-                    }
-                    
-                    // Set default voice
-                    if (data.voice && voiceSelect.querySelector(`option[value="${data.voice}"]`)) {
-                        voiceSelect.value = data.voice;
-                    }
-                    
-                    // Set default model
-                    if (data.model && modelSelect.querySelector(`option[value="${data.model}"]`)) {
-                        modelSelect.value = data.model;
-                    }
-                    
-                    // Set default TTS model
-                    if (data.tts_model && ttsModelSelect.querySelector(`option[value="${data.tts_model}"]`)) {
-                        ttsModelSelect.value = data.tts_model;
-                    }
-                    
-                    // Set default transcription model
-                    if (data.transcription_model && transcriptionModelSelect.querySelector(`option[value="${data.transcription_model}"]`)) {
-                        transcriptionModelSelect.value = data.transcription_model;
-                    }
-                }, 300); // Small delay to ensure dropdowns are populated
-            })
-            .catch(error => {
-                console.error('Error fetching default settings:', error);
-            });
-    }
-    
-    // Add a simple heartbeat to keep the connection alive
-    function startHeartbeat() {
-        setInterval(() => {
-            if (websocket && websocket.readyState === WebSocket.OPEN) {
-                // Send a ping to keep the connection alive
-                try {
-                    websocket.send(JSON.stringify({action: "ping"}));
-                } catch (e) {
-                    console.log("Error sending heartbeat", e);
-                }
-            }
-        }, 30000); // Every 30 seconds
-    }
-    
-    // Character selection change handler
+            // Default to customer_support if available
+            const opts = [...characterSelect.options].map(o => o.value);
+            if (opts.includes('customer_support')) characterSelect.value = 'customer_support';
+        })
+        .catch(() => {});
+
     characterSelect.addEventListener('change', function() {
-        const selectedCharacter = this.value;
-        console.log(`Character selected: ${selectedCharacter}`);
-        
-        // Clear existing conversation display
-        const messagesContainer = document.getElementById('messages');
-        messagesContainer.innerHTML = '';
-        
-        // Set the selected character
+        messagesDiv.innerHTML = '';
         fetch('/set_character', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ character: selectedCharacter })
-        })
-        .then(response => response.json())
-        .then(data => {
-            console.log('Character set response:', data);
-            
-            // Check if this is a story/game character and fetch history
-            if (selectedCharacter.startsWith('story_') || selectedCharacter.startsWith('game_')) {
-                // Fetch history for this character
-                fetch('/get_character_history')
-                    .then(response => response.json())
-                    .then(historyData => {
-                        if (historyData.status === 'success' && historyData.history) {
-                            // Display the history
-                            const historyLines = historyData.history.split('\n');
-                            let currentSpeaker = null;
-                            let currentMessage = '';
-                            
-                            // Process each line
-                            historyLines.forEach(line => {
-                                if (line.startsWith('User:')) {
-                                    // Display previous message if exists
-                                    if (currentSpeaker && currentMessage) {
-                                        if (currentSpeaker === 'User') {
-                                            displayMessage(`You: ${currentMessage}`);
-                                        } else {
-                                            displayMessage(currentMessage);
-                                        }
-                                    }
-                                    
-                                    // Start new user message
-                                    currentSpeaker = 'User';
-                                    currentMessage = line.substring(5).trim();
-                                } else if (line.startsWith('Assistant:')) {
-                                    // Display previous message if exists
-                                    if (currentSpeaker && currentMessage) {
-                                        if (currentSpeaker === 'User') {
-                                            displayMessage(`You: ${currentMessage}`);
-                                        } else {
-                                            displayMessage(currentMessage);
-                                        }
-                                    }
-                                    
-                                    // Start new assistant message
-                                    currentSpeaker = 'Assistant';
-                                    currentMessage = line.substring(10).trim();
-                                } else if (line.trim() && currentSpeaker) {
-                                    // Continuation of current message
-                                    currentMessage += '\n' + line;
-                                }
-                            });
-                            
-                            // Display the last message
-                            if (currentSpeaker && currentMessage) {
-                                if (currentSpeaker === 'User') {
-                                    displayMessage(`You: ${currentMessage}`);
-                                } else {
-                                    displayMessage(currentMessage);
-                                }
-                            }
-                            
-                            // Add a note that this is previous history
-                            displayMessage(`Previous conversation history loaded for ${selectedCharacter.replace('_', ' ')}. Press Start to continue.`, "system-message");
-                            
-                            // Scroll to bottom to show latest messages
-                            conversation.scrollTop = conversation.scrollHeight;
-                        }
-                    })
-                    .catch(error => {
-                        console.error('Error fetching character history:', error);
-                    });
-            }
-        })
-        .catch(error => console.error('Error setting character:', error));
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ character: this.value })
+        }).catch(() => {});
     });
-    
-    // Initialize
-    loadThemePreference();
-    setDarkModeDefault();
-    fetchCharacters();
-    fetchDefaultSettings();
-    connectWebSocket();
-    startHeartbeat();
+
+    // ── Theme ─────────────────────────────────────────────────────────────────
+
+    function updateThemeIcon() {
+        const dark = document.body.classList.contains('dark-mode');
+        themeToggle.innerHTML = dark
+            ? '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>'
+            : '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+    }
+
+    themeToggle.addEventListener('click', function() {
+        document.body.classList.toggle('dark-mode');
+        localStorage.setItem('darkMode', document.body.classList.contains('dark-mode'));
+        updateThemeIcon();
+    });
+
+    const stored = localStorage.getItem('darkMode');
+    if (stored !== null) document.body.classList.toggle('dark-mode', stored === 'true');
+    else document.body.classList.add('dark-mode');
+    updateThemeIcon();
+
+    // ── Download ──────────────────────────────────────────────────────────────
+
+    downloadButton.addEventListener('click', async function() {
+        const r = await fetch('/download_history');
+        if (r.ok) {
+            const blob = await r.blob();
+            const url  = URL.createObjectURL(blob);
+            const a    = document.createElement('a');
+            a.href = url; a.download = 'conversation_history.txt'; a.click();
+            URL.revokeObjectURL(url);
+        }
+    });
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    setStatus('idle');
     stopBtn.disabled = true;
 });
