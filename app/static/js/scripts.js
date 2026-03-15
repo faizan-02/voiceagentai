@@ -1,50 +1,57 @@
 document.addEventListener("DOMContentLoaded", function() {
-    const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const websocket = new WebSocket(`${wsProto}://${window.location.host}/ws`);
-    const themeToggle = document.getElementById('theme-toggle');
-    const downloadButton = document.getElementById('download-button');
-    const body = document.body;
-    const voiceAnimation = document.getElementById('voice-animation');
-    const startButton = document.getElementById('start-conversation-btn');
-    const stopButton = document.getElementById('stop-conversation-btn');
-    const clearButton = document.getElementById('clear-conversation-btn');
-    const messages = document.getElementById('messages');
-    const micIcon = document.getElementById('mic-icon');
-    const characterSelect = document.getElementById('character-select');
-    const providerSelect = document.getElementById('provider-select');
-    const ttsSelect = document.getElementById('tts-select');
-    const openaiVoiceSelect = document.getElementById('openai-voice-select');
-    const statusBar = document.getElementById('status-bar');
-
-    // Set initial TTS provider from server
-    const initialTTS = ttsSelect.dataset.initial;
-    if (initialTTS && initialTTS !== 'None' && initialTTS !== '') {
-        ttsSelect.value = initialTTS;
-    }
-
+    // ─── DOM refs ─────────────────────────────────────────────────────────────
+    const themeToggle        = document.getElementById('theme-toggle');
+    const downloadButton     = document.getElementById('download-button');
+    const body               = document.body;
+    const voiceAnimation     = document.getElementById('voice-animation');
+    const startButton        = document.getElementById('start-conversation-btn');
+    const stopButton         = document.getElementById('stop-conversation-btn');
+    const clearButton        = document.getElementById('clear-conversation-btn');
+    const messages           = document.getElementById('messages');
+    const micIcon            = document.getElementById('mic-icon');
+    const characterSelect    = document.getElementById('character-select');
+    const providerSelect     = document.getElementById('provider-select');
+    const ttsSelect          = document.getElementById('tts-select');
+    const openaiVoiceSelect  = document.getElementById('openai-voice-select');
+    const statusBar          = document.getElementById('status-bar');
     const elevenLabsVoiceSelect = document.getElementById('elevenlabs-voice-select');
-    const kokoroVoiceSelect = document.getElementById('kokoro-voice-select');
-    const openaiModelSelect = document.getElementById('openai-model-select');
-    const ollamaModelSelect = document.getElementById('ollama-model-select');
-    const xaiModelSelect = document.getElementById('xai-model-select');
-    const voiceSpeedSelect = document.getElementById('voice-speed-select');
+    const kokoroVoiceSelect  = document.getElementById('kokoro-voice-select');
+    const openaiModelSelect  = document.getElementById('openai-model-select');
+    const ollamaModelSelect  = document.getElementById('ollama-model-select');
+    const xaiModelSelect     = document.getElementById('xai-model-select');
+    const voiceSpeedSelect   = document.getElementById('voice-speed-select');
     const transcriptionSelect = document.getElementById('transcription-select');
 
-    let aiMessageQueue = [];
-    let isAISpeaking = false;
+    // Set initial TTS from server-rendered attribute
+    const initialTTS = ttsSelect.dataset.initial;
+    if (initialTTS && initialTTS !== 'None' && initialTTS !== '') ttsSelect.value = initialTTS;
 
-    // Agent state: 'idle' | 'listening' | 'thinking' | 'speaking' | 'goodbye'
-    let agentState = 'idle';
+    // ─── Runtime state ────────────────────────────────────────────────────────
+    let agentState          = 'idle';
+    let websocket           = null;
+    let mediaStream         = null;
+    let mediaRecorder       = null;
+    let audioChunks         = [];
+    let audioContext        = null;
+    let analyser            = null;
+    let vadTimer            = null;
+    let isConversationActive = false;
+    let currentAudio        = null;
+    let audioResponseReceived = false;
 
-    // Fetch and populate characters as soon as page loads
+    // VAD tuning
+    const SILENCE_THRESHOLD  = 12;    // RMS (0-100 scale) below this = silence
+    const SILENCE_DURATION_MS = 1600; // ms of continuous silence before submitting
+    const MIN_SPEECH_CHUNKS  = 4;     // minimum 100 ms chunks with speech
+    let silenceStart  = null;
+    let speechChunks  = 0;
+    let hasSpeech     = false;
+
+    // Populate dropdowns on load
     fetchCharacters();
+    if (providerSelect.value === 'ollama') fetchOllamaModels();
 
-    // Fetch Ollama models if that's the current provider
-    if (providerSelect.value === 'ollama') {
-        fetchOllamaModels();
-    }
-
-    // ─── State Management ───────────────────────────────────────────────────────
+    // ─── Agent state machine ──────────────────────────────────────────────────
 
     function setAgentState(state) {
         agentState = state;
@@ -56,13 +63,7 @@ document.addEventListener("DOMContentLoaded", function() {
     function updateStatusBar() {
         if (!statusBar) return;
         statusBar.className = 'status-bar status-' + agentState;
-        const icons = {
-            idle:      '○',
-            listening: '◉',
-            thinking:  '◌',
-            speaking:  '▶',
-            goodbye:   '✓'
-        };
+        const icons  = { idle: '○', listening: '◉', thinking: '◌', speaking: '▶', goodbye: '✓' };
         const labels = {
             idle:      'Ready — press Start to begin',
             listening: 'Listening…',
@@ -70,137 +71,355 @@ document.addEventListener("DOMContentLoaded", function() {
             speaking:  'Speaking…',
             goodbye:   'Conversation ended'
         };
-        statusBar.innerHTML = `<span class="status-dot">${icons[agentState] || '○'}</span>
-                               <span class="status-label">${labels[agentState] || ''}</span>`;
+        statusBar.innerHTML =
+            `<span class="status-dot">${icons[agentState] || '○'}</span>` +
+            `<span class="status-label">${labels[agentState] || ''}</span>`;
     }
 
     function updateButtonStates() {
         const active = (agentState !== 'idle' && agentState !== 'goodbye');
-        startButton.disabled = active || !websocket || websocket.readyState !== WebSocket.OPEN;
+        startButton.disabled = active;
         stopButton.disabled  = !active;
-
-        startButton.classList.toggle('btn-active', !active);
-        stopButton.classList.toggle('btn-danger-active', active);
+        startButton.classList.toggle('btn-active',        !active);
+        stopButton.classList.toggle('btn-danger-active',   active);
     }
 
     function updateMicIcon() {
         micIcon.classList.remove('mic-on', 'mic-off', 'mic-waiting', 'pulse-animation');
-        if (agentState === 'listening') {
-            micIcon.classList.add('mic-on', 'pulse-animation');
-        } else if (agentState === 'thinking') {
-            micIcon.classList.add('mic-waiting');
-        } else if (agentState === 'speaking') {
-            micIcon.classList.add('mic-on');
-        } else {
-            micIcon.classList.add('mic-off');
-        }
+        if      (agentState === 'listening') micIcon.classList.add('mic-on', 'pulse-animation');
+        else if (agentState === 'thinking')  micIcon.classList.add('mic-waiting');
+        else if (agentState === 'speaking')  micIcon.classList.add('mic-on');
+        else                                 micIcon.classList.add('mic-off');
     }
 
     // ─── WebSocket ────────────────────────────────────────────────────────────
 
-    websocket.onopen = function() {
-        console.log("WebSocket open.");
-        setAgentState('idle');
-    };
+    function connectWebSocket() {
+        const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        websocket = new WebSocket(`${wsProto}://${window.location.host}/ws_voice`);
 
-    websocket.onclose = function() {
-        console.log("WebSocket closed.");
-        setAgentState('idle');
-    };
+        websocket.onopen = function() {
+            console.log("ws_voice: connected");
+            websocket.send(JSON.stringify({
+                action:    "start",
+                character: characterSelect.value,
+                model:     getSelectedModel(),
+                voice:     openaiVoiceSelect.value
+            }));
+        };
 
-    websocket.onerror = function(event) {
-        console.error("WebSocket error:", event);
-        setAgentState('idle');
-    };
+        websocket.onclose = function() {
+            console.log("ws_voice: closed");
+            stopVAD();
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+            if (isConversationActive) { isConversationActive = false; setAgentState('idle'); }
+        };
 
-    websocket.onmessage = function(event) {
+        websocket.onerror = function(err) {
+            console.error("ws_voice error:", err);
+            displayMessage("Connection error. Please try again.", 'error-message');
+            isConversationActive = false;
+            setAgentState('idle');
+        };
+
+        websocket.onmessage = handleServerMessage;
+    }
+
+    function handleServerMessage(event) {
         let data;
+        try { data = JSON.parse(event.data); }
+        catch (e) { console.error("Bad JSON:", event.data); return; }
 
-        if (typeof event.data === 'string' && !event.data.startsWith('{') && !event.data.startsWith('[')) {
-            displayMessage(event.data);
-            return;
-        }
+        switch (data.action) {
 
-        try {
-            data = JSON.parse(event.data);
-        } catch (e) {
-            if (event.data && typeof event.data === 'string') {
-                displayMessage(event.data);
-                return;
-            }
-            data = { message: event.data };
-        }
-
-        if (data.action === "ai_start_speaking") {
-            isAISpeaking = true;
-            setAgentState('speaking');
-            showVoiceAnimation();
-            setTimeout(processQueuedMessages, 100);
-
-        } else if (data.action === "ai_stop_speaking") {
-            isAISpeaking = false;
-            hideVoiceAnimation();
-            processQueuedMessages();
-            // Go back to listening if conversation is still active
-            if (agentState === 'speaking') {
+            case "listening":
                 setAgentState('listening');
-            }
+                hideThinkingIndicator();
+                hideVoiceAnimation();
+                showListeningIndicator();
+                audioResponseReceived = false;
+                startRecording();
+                break;
 
-        } else if (data.action === "thinking") {
-            setAgentState('thinking');
-            showThinkingIndicator();
-
-        } else if (data.action === "thinking_done") {
-            hideThinkingIndicator();
-            // State will be updated to 'speaking' when ai_start_speaking arrives
-
-        } else if (data.action === "conversation_ended") {
-            isAISpeaking = false;
-            hideVoiceAnimation();
-            hideThinkingIndicator();
-            hideListeningIndicator();
-            setAgentState('goodbye');
-            displayMessage(data.message || "Goodbye! Chat again soon.", 'goodbye-message');
-            // Reset to idle after a short delay
-            setTimeout(() => setAgentState('idle'), 3000);
-
-        } else if (data.action === "error") {
-            console.error("Server error:", data.message);
-            displayMessage(data.message, 'error-message');
-
-        } else if (data.action === "waiting_for_speech") {
-            setAgentState('listening');
-            showListeningIndicator();
-
-        } else if (data.message) {
-            if (data.message.startsWith('You:')) {
-                setAgentState('thinking');
-                displayMessage(data.message);
+            case "transcript":
                 hideListeningIndicator();
+                if (data.text) displayMessage(data.text, 'user-message');
+                break;
+
+            case "thinking":
+                setAgentState('thinking');
+                hideListeningIndicator();
+                showThinkingIndicator();
+                break;
+
+            case "response_text":
+                hideThinkingIndicator();
+                if (data.text) displayMessage(data.text, 'ai-message');
+                break;
+
+            case "audio_response":
+                audioResponseReceived = true;
+                setAgentState('speaking');
+                showVoiceAnimation();
+                playAudioResponse(data.data, data.format || 'mp3');
+                break;
+
+            case "done":
+                // If no audio arrived (e.g. TTS error path), start next turn now.
+                // Otherwise audio.onended handles the next turn.
+                if (!audioResponseReceived) {
+                    startNextTurn();
+                }
+                break;
+
+            case "error":
+                console.error("Server error:", data.message);
+                displayMessage(data.message || "An error occurred.", 'error-message');
+                hideThinkingIndicator();
+                hideListeningIndicator();
+                hideVoiceAnimation();
+                if (isConversationActive) {
+                    setTimeout(startNextTurn, 1200);
+                }
+                break;
+        }
+    }
+
+    function startNextTurn() {
+        if (!isConversationActive) return;
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+        audioResponseReceived = false;
+        setAgentState('listening');
+        showListeningIndicator();
+        startRecording();
+    }
+
+    // ─── Microphone init ──────────────────────────────────────────────────────
+
+    async function initMicrophone() {
+        try {
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioContext.createMediaStreamSource(mediaStream);
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 512;
+            source.connect(analyser);
+            return true;
+        } catch (err) {
+            console.error("Mic error:", err);
+            displayMessage("Microphone access denied. Please allow microphone access and try again.", 'error-message');
+            return false;
+        }
+    }
+
+    // ─── Recording + VAD ─────────────────────────────────────────────────────
+
+    function getSupportedMimeType() {
+        const types = [
+            'audio/webm;codecs=opus',
+            'audio/webm',
+            'audio/ogg;codecs=opus',
+            'audio/ogg',
+            ''
+        ];
+        for (const t of types) {
+            if (!t || MediaRecorder.isTypeSupported(t)) return t;
+        }
+        return '';
+    }
+
+    function startRecording() {
+        if (!mediaStream || !isConversationActive) return;
+
+        audioChunks  = [];
+        hasSpeech    = false;
+        silenceStart = null;
+        speechChunks = 0;
+
+        const mimeType = getSupportedMimeType();
+        try {
+            mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : {});
+        } catch (e) {
+            mediaRecorder = new MediaRecorder(mediaStream);
+        }
+
+        mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+        mediaRecorder.start(100);
+
+        // Start VAD polling at 100ms intervals
+        vadTimer = setInterval(checkVAD, 100);
+    }
+
+    function checkVAD() {
+        if (!analyser || !isConversationActive) return;
+
+        const buf = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteTimeDomainData(buf);
+
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) {
+            const v = (buf[i] - 128) / 128;
+            sum += v * v;
+        }
+        const rms = Math.sqrt(sum / buf.length) * 100;
+
+        if (rms > SILENCE_THRESHOLD) {
+            silenceStart = null;
+            hasSpeech    = true;
+            speechChunks++;
+        } else if (hasSpeech) {
+            if (!silenceStart) silenceStart = Date.now();
+            if (Date.now() - silenceStart > SILENCE_DURATION_MS) {
+                submitRecording();
+            }
+        }
+    }
+
+    function submitRecording() {
+        stopVAD();
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+
+        mediaRecorder.onstop = async () => {
+            if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
+                // Encode and send to server
+                const blob       = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                const arrayBuf   = await blob.arrayBuffer();
+                const base64     = arrayBufferToBase64(arrayBuf);
+                audioChunks = [];
+
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    hideListeningIndicator();
+                    setAgentState('thinking');
+                    showThinkingIndicator();
+                    websocket.send(JSON.stringify({ action: "audio", data: base64 }));
+                }
             } else {
-                // Plain text from AI (displayed before or after speech)
-                aiMessageQueue.push(data.message);
-                if (!isAISpeaking) {
-                    processQueuedMessages();
+                // Too short / no speech — restart listening
+                audioChunks = [];
+                if (isConversationActive) {
+                    startNextTurn();
                 }
             }
+        };
 
-        } else if (data.action === "recording_started") {
-            setAgentState('listening');
-            showListeningIndicator();
+        mediaRecorder.stop();
+    }
 
-        } else if (data.action === "recording_stopped") {
-            hideListeningIndicator();
-            if (agentState === 'listening') {
-                setAgentState('thinking');
-            }
+    function stopRecording() {
+        stopVAD();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.ondataavailable = null;
+            mediaRecorder.onstop = null;
+            try { mediaRecorder.stop(); } catch (_) {}
         }
-    };
+        audioChunks = [];
+    }
 
-    function processQueuedMessages() {
-        while (aiMessageQueue.length > 0 && !isAISpeaking) {
-            displayMessage(aiMessageQueue.shift());
+    function stopVAD() {
+        if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
+    }
+
+    function arrayBufferToBase64(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let bin = '';
+        const chunkSize = 8192;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+            bin += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
         }
+        return btoa(bin);
+    }
+
+    // ─── Audio playback ───────────────────────────────────────────────────────
+
+    function playAudioResponse(base64Data, format) {
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+
+        const byteStr = atob(base64Data);
+        const bytes   = new Uint8Array(byteStr.length);
+        for (let i = 0; i < byteStr.length; i++) bytes[i] = byteStr.charCodeAt(i);
+
+        const mimeType = format === 'mp3' ? 'audio/mpeg' : `audio/${format}`;
+        const blob     = new Blob([bytes], { type: mimeType });
+        const url      = URL.createObjectURL(blob);
+
+        currentAudio = new Audio(url);
+        currentAudio.playbackRate = parseFloat(voiceSpeedSelect.value) || 1.0;
+
+        currentAudio.onended = () => {
+            URL.revokeObjectURL(url);
+            currentAudio = null;
+            hideVoiceAnimation();
+            startNextTurn();
+        };
+
+        currentAudio.onerror = (e) => {
+            console.error("Playback error:", e);
+            URL.revokeObjectURL(url);
+            currentAudio = null;
+            hideVoiceAnimation();
+            startNextTurn();
+        };
+
+        currentAudio.play().catch(e => {
+            console.error("play() rejected:", e);
+            hideVoiceAnimation();
+            startNextTurn();
+        });
+    }
+
+    // ─── Button actions ───────────────────────────────────────────────────────
+
+    startButton.addEventListener('click', async function() {
+        if (isConversationActive) return;
+
+        const ok = await initMicrophone();
+        if (!ok) return;
+
+        isConversationActive = true;
+        setAgentState('listening');
+        connectWebSocket();
+    });
+
+    stopButton.addEventListener('click', function() {
+        isConversationActive = false;
+        stopVAD();
+        stopRecording();
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            try { websocket.send(JSON.stringify({ action: "stop" })); } catch (_) {}
+            websocket.close();
+        }
+        if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        hideListeningIndicator();
+        hideThinkingIndicator();
+        hideVoiceAnimation();
+        setAgentState('goodbye');
+        displayMessage("Conversation ended.", 'goodbye-message');
+        setTimeout(() => setAgentState('idle'), 3000);
+    });
+
+    clearButton.addEventListener('click', async function() {
+        messages.innerHTML = '';
+        try {
+            await fetch('/clear_history', { method: 'POST' });
+            displayMessage("Conversation history cleared.", "system-message");
+        } catch (_) {
+            displayMessage("Error clearing conversation history.", "error-message");
+        }
+    });
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    function getSelectedModel() {
+        const provider = providerSelect.value;
+        if (provider === 'openai')    return openaiModelSelect.value;
+        if (provider === 'ollama')    return ollamaModelSelect.value;
+        if (provider === 'xai')       return xaiModelSelect.value;
+        if (provider === 'anthropic') {
+            const el = document.getElementById('anthropic-model-select');
+            return el ? el.value : 'claude-sonnet-4-6';
+        }
+        return openaiModelSelect.value;
     }
 
     // ─── Indicators ───────────────────────────────────────────────────────────
@@ -210,7 +429,10 @@ document.addEventListener("DOMContentLoaded", function() {
         const el = document.createElement('div');
         el.className = 'listening-indicator';
         el.id = 'listening-indicator';
-        el.innerHTML = 'Listening <div class="listening-dots"><div class="dot"></div><div class="dot" style="animation-delay:0.2s"></div><div class="dot" style="animation-delay:0.4s"></div></div>';
+        el.innerHTML = 'Listening <div class="listening-dots">' +
+            '<div class="dot"></div>' +
+            '<div class="dot" style="animation-delay:0.2s"></div>' +
+            '<div class="dot" style="animation-delay:0.4s"></div></div>';
         messages.appendChild(el);
         scrollToBottom();
     }
@@ -225,7 +447,10 @@ document.addEventListener("DOMContentLoaded", function() {
         const el = document.createElement('div');
         el.className = 'thinking-indicator';
         el.id = 'thinking-indicator';
-        el.innerHTML = 'Thinking <div class="thinking-dots"><div class="dot"></div><div class="dot" style="animation-delay:0.2s"></div><div class="dot" style="animation-delay:0.4s"></div></div>';
+        el.innerHTML = 'Thinking <div class="thinking-dots">' +
+            '<div class="dot"></div>' +
+            '<div class="dot" style="animation-delay:0.2s"></div>' +
+            '<div class="dot" style="animation-delay:0.4s"></div></div>';
         messages.appendChild(el);
         scrollToBottom();
     }
@@ -235,8 +460,6 @@ document.addEventListener("DOMContentLoaded", function() {
         if (el) el.remove();
     }
 
-    // ─── Voice Animation ──────────────────────────────────────────────────────
-
     function showVoiceAnimation() {
         voiceAnimation.classList.remove('hidden');
         scrollToBottom();
@@ -244,122 +467,65 @@ document.addEventListener("DOMContentLoaded", function() {
 
     function hideVoiceAnimation() {
         voiceAnimation.classList.add('hidden');
-        setTimeout(() => {
-            scrollToBottom();
-            processQueuedMessages();
-        }, 100);
+        setTimeout(scrollToBottom, 100);
     }
 
     function scrollToBottom() {
-        const conversation = document.getElementById('conversation');
-        conversation.scrollTop = conversation.scrollHeight;
+        const conv = document.getElementById('conversation');
+        if (conv) conv.scrollTop = conv.scrollHeight;
     }
 
-    // ─── Message Display ─────────────────────────────────────────────────────
+    // ─── Message display ──────────────────────────────────────────────────────
 
-    function displayMessage(message, className = '') {
-        let formattedMessage = message;
+    function displayMessage(message, className) {
+        let text = String(message).replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+        if (!text) return;
 
-        // Strip out <think>...</think> blocks
-        formattedMessage = formattedMessage.replace(/<think>[\s\S]*?<\/think>/g, '');
-
-        const messageElement = document.createElement('div');
+        const el = document.createElement('div');
         if (className) {
-            messageElement.className = className;
-        } else if (formattedMessage.startsWith('You:')) {
-            messageElement.className = 'user-message';
-            formattedMessage = formattedMessage.replace('You:', '').trim();
+            el.className = className;
+        } else if (text.startsWith('You:')) {
+            el.className = 'user-message';
+            text = text.replace('You:', '').trim();
         } else {
-            messageElement.className = 'ai-message';
+            el.className = 'ai-message';
         }
 
-        if (formattedMessage.includes('```')) {
-            let segments = formattedMessage.split(/(```(?:.*?)```)/gs);
-            segments.forEach(segment => {
-                if (segment.startsWith('```') && segment.endsWith('```')) {
-                    const codeContent = segment.slice(3, -3).trim();
-                    const pre = document.createElement('pre');
+        if (text.includes('```')) {
+            text.split(/(```(?:.*?)```)/gs).forEach(seg => {
+                if (seg.startsWith('```') && seg.endsWith('```')) {
+                    const pre  = document.createElement('pre');
                     const code = document.createElement('code');
-                    code.textContent = codeContent;
+                    code.textContent = seg.slice(3, -3).trim();
                     pre.appendChild(code);
-                    messageElement.appendChild(pre);
-                } else if (segment.trim()) {
-                    segment.split('\n').forEach((line, index) => {
-                        if (index > 0) messageElement.appendChild(document.createElement('br'));
-                        messageElement.appendChild(document.createTextNode(line));
+                    el.appendChild(pre);
+                } else if (seg.trim()) {
+                    seg.split('\n').forEach((line, i) => {
+                        if (i > 0) el.appendChild(document.createElement('br'));
+                        el.appendChild(document.createTextNode(line));
                     });
                 }
             });
-        } else if (formattedMessage.includes('\n')) {
-            formattedMessage.split('\n').forEach((line, index) => {
-                if (index > 0) messageElement.appendChild(document.createElement('br'));
-                messageElement.appendChild(document.createTextNode(line));
+        } else if (text.includes('\n')) {
+            text.split('\n').forEach((line, i) => {
+                if (i > 0) el.appendChild(document.createElement('br'));
+                el.appendChild(document.createTextNode(line));
             });
         } else {
-            messageElement.textContent = formattedMessage;
+            el.textContent = text;
         }
 
-        messages.appendChild(messageElement);
+        messages.appendChild(el);
         setTimeout(scrollToBottom, 10);
     }
 
-    // ─── Button Actions ───────────────────────────────────────────────────────
-
-    startButton.addEventListener('click', function() {
-        const selectedCharacter = document.getElementById('character-select').value;
-        websocket.send(JSON.stringify({ action: "start", character: selectedCharacter }));
-        setAgentState('listening');
-    });
-
-    stopButton.addEventListener('click', function() {
-        websocket.send(JSON.stringify({ action: "stop" }));
-        stopButton.disabled = true;
-        // Fallback reset in case server doesn't send conversation_ended within 10s
-        setTimeout(() => {
-            if (agentState !== 'idle' && agentState !== 'goodbye') setAgentState('idle');
-        }, 10000);
-    });
-
-    clearButton.addEventListener('click', async function() {
-        messages.innerHTML = '';
-        try {
-            await fetch('/clear_history', { method: 'POST' });
-            displayMessage("Conversation history cleared.", "system-message");
-        } catch (error) {
-            displayMessage("Error clearing conversation history", "error-message");
-        }
-    });
-
-    // ─── Character & Settings ─────────────────────────────────────────────────
+    // ─── Characters ───────────────────────────────────────────────────────────
 
     function fetchCharacters() {
         fetch('/characters')
             .then(r => r.json())
             .then(data => populateCharacterSelect(data.characters))
             .catch(err => console.error('Error fetching characters:', err));
-    }
-
-    function fetchOllamaModels() {
-        fetch('/ollama_models')
-            .then(r => r.json())
-            .then(data => {
-                if (data.models && data.models.length > 0) populateOllamaModelSelect(data.models);
-            })
-            .catch(err => console.error('Error fetching Ollama models:', err));
-    }
-
-    function populateOllamaModelSelect(models) {
-        const currentValue = ollamaModelSelect.value;
-        ollamaModelSelect.innerHTML = '';
-        models.sort((a, b) => a.localeCompare(b)).forEach(model => {
-            const opt = document.createElement('option');
-            opt.value = model;
-            opt.textContent = model;
-            ollamaModelSelect.appendChild(opt);
-        });
-        if (models.includes(currentValue)) ollamaModelSelect.value = currentValue;
-        else if (models.includes('llama3.2')) ollamaModelSelect.value = 'llama3.2';
-        else if (models.length > 0) ollamaModelSelect.value = models[0];
     }
 
     function populateCharacterSelect(characters) {
@@ -370,135 +536,113 @@ document.addEventListener("DOMContentLoaded", function() {
             opt.textContent = character.replace(/_/g, ' ');
             characterSelect.appendChild(opt);
         });
-        const defaultCharacter = document.querySelector('meta[name="default-character"]')?.getAttribute('content');
-        if (defaultCharacter) characterSelect.value = defaultCharacter;
+        const defaultChar = document.querySelector('meta[name="default-character"]')?.getAttribute('content');
+        if (defaultChar && characters.includes(defaultChar)) {
+            characterSelect.value = defaultChar;
+        } else if (characters.length > 0) {
+            characterSelect.value = characters[0];
+        }
         toggleSpaSidebar(characterSelect.value);
     }
 
     characterSelect.addEventListener('change', function() {
-        const selectedCharacter = this.value;
-        toggleSpaSidebar(selectedCharacter);
+        const ch = this.value;
+        toggleSpaSidebar(ch);
         messages.innerHTML = '';
-
         fetch('/set_character', {
-            method: 'POST',
+            method:  'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ character: selectedCharacter })
-        })
-        .then(r => r.json())
-        .then(data => {
-            if (selectedCharacter.startsWith('story_') || selectedCharacter.startsWith('game_')) {
-                fetch('/get_character_history')
-                    .then(r => r.json())
-                    .then(historyData => {
-                        if (historyData.status === 'success' && historyData.history) {
-                            const lines = historyData.history.split('\n');
-                            let speaker = null, msg = '';
-                            lines.forEach(line => {
-                                if (line.startsWith('User:')) {
-                                    if (speaker && msg) displayMessage(speaker === 'User' ? `You: ${msg}` : msg);
-                                    speaker = 'User'; msg = line.substring(5).trim();
-                                } else if (line.startsWith('Assistant:')) {
-                                    if (speaker && msg) displayMessage(speaker === 'User' ? `You: ${msg}` : msg);
-                                    speaker = 'Assistant'; msg = line.substring(10).trim();
-                                } else if (line.trim() && speaker) {
-                                    msg += '\n' + line;
-                                }
-                            });
-                            if (speaker && msg) displayMessage(speaker === 'User' ? `You: ${msg}` : msg);
-                            displayMessage(`History loaded for ${selectedCharacter.replace(/_/g, ' ')}. Press Start to continue.`, 'system-message');
-                            scrollToBottom();
-                        }
-                    });
-            }
-        })
-        .catch(err => console.error('Error setting character:', err));
+            body:    JSON.stringify({ character: ch })
+        }).catch(err => console.error('Error setting character:', err));
     });
 
-    // ─── Settings Listeners ───────────────────────────────────────────────────
+    // ─── Ollama models ────────────────────────────────────────────────────────
 
-    function setProvider() {
-        const provider = providerSelect.value;
-        websocket.send(JSON.stringify({ action: "set_provider", provider }));
-        if (provider === 'ollama') fetchOllamaModels();
+    function fetchOllamaModels() {
+        fetch('/ollama_models')
+            .then(r => r.json())
+            .then(data => { if (data.models?.length) populateOllamaModelSelect(data.models); })
+            .catch(err => console.error('Error fetching Ollama models:', err));
     }
 
-    providerSelect.addEventListener('change', setProvider);
-    ttsSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_tts", tts: ttsSelect.value })));
-    openaiVoiceSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_openai_voice", voice: openaiVoiceSelect.value })));
-    openaiModelSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_openai_model", model: openaiModelSelect.value })));
-    ollamaModelSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_ollama_model", model: ollamaModelSelect.value })));
-    xaiModelSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_xai_model", model: xaiModelSelect.value })));
-    voiceSpeedSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_voice_speed", speed: voiceSpeedSelect.value })));
-    elevenLabsVoiceSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_elevenlabs_voice", voice: elevenLabsVoiceSelect.value })));
-    kokoroVoiceSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_kokoro_voice", voice: kokoroVoiceSelect.value })));
-
-    const anthropicModelSelect = document.getElementById('anthropic-model-select');
-    if (anthropicModelSelect) {
-        anthropicModelSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_anthropic_model", model: anthropicModelSelect.value })));
+    function populateOllamaModelSelect(models) {
+        const current = ollamaModelSelect.value;
+        ollamaModelSelect.innerHTML = '';
+        models.sort((a, b) => a.localeCompare(b)).forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m; opt.textContent = m;
+            ollamaModelSelect.appendChild(opt);
+        });
+        if (models.includes(current)) ollamaModelSelect.value = current;
+        else if (models.includes('llama3.2')) ollamaModelSelect.value = 'llama3.2';
+        else ollamaModelSelect.value = models[0];
     }
+
+    providerSelect.addEventListener('change', function() {
+        if (this.value === 'ollama') fetchOllamaModels();
+    });
 
     transcriptionSelect.addEventListener('change', function() {
         fetch('/set_transcription_model', {
-            method: 'POST',
+            method:  'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: this.value })
+            body:    JSON.stringify({ model: this.value })
         });
     });
 
-    // ─── Spa Sidebar ──────────────────────────────────────────────────────────
+    // ─── Spa sidebar ──────────────────────────────────────────────────────────
 
     function toggleSpaSidebar(selectedCharacter) {
-        const spaSidebar = document.getElementById('spa-sidebar');
-        if (!spaSidebar) return;
+        const sidebar = document.getElementById('spa-sidebar');
+        if (!sidebar) return;
         if (selectedCharacter === 'customer_support') {
-            spaSidebar.classList.remove('hidden');
+            sidebar.classList.remove('hidden');
             buildSpaCalendar();
         } else {
-            spaSidebar.classList.add('hidden');
+            sidebar.classList.add('hidden');
         }
     }
 
     function buildSpaCalendar() {
-        const calendarContainer = document.getElementById('spa-calendar');
-        const todayLabel = document.getElementById('spa-today');
-        if (!calendarContainer || !todayLabel) return;
-        const now = new Date();
-        const monthNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-        todayLabel.textContent = `Today: ${now.getDate()} ${monthNames[now.getMonth()]} ${now.getFullYear()}`;
-        calendarContainer.innerHTML = '';
-        const selectedDateLabel = document.getElementById('spa-selected-date');
-        const end = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        const header = document.createElement('div');
+        const cal   = document.getElementById('spa-calendar');
+        const today = document.getElementById('spa-today');
+        if (!cal || !today) return;
+        const now   = new Date();
+        const months = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+        today.textContent = `Today: ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}`;
+        cal.innerHTML = '';
+        const selectedLabel = document.getElementById('spa-selected-date');
+        const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+        const header  = document.createElement('div');
         header.className = 'spa-calendar-header';
-        header.textContent = `${monthNames[now.getMonth()]} ${now.getFullYear()}`;
-        calendarContainer.appendChild(header);
+        header.textContent = `${months[now.getMonth()]} ${now.getFullYear()}`;
+        cal.appendChild(header);
         const grid = document.createElement('div');
         grid.className = 'spa-calendar-grid';
-        const firstDay = new Date(now.getFullYear(), now.getMonth(), 1).getDay();
-        for (let i = 0; i < (firstDay === 0 ? 6 : firstDay - 1); i++) {
+        const firstDow = new Date(now.getFullYear(), now.getMonth(), 1).getDay();
+        for (let i = 0; i < (firstDow === 0 ? 6 : firstDow - 1); i++) {
             const empty = document.createElement('button');
             empty.className = 'spa-calendar-day empty';
             empty.disabled = true;
             grid.appendChild(empty);
         }
-        for (let d = 1; d <= end.getDate(); d++) {
-            const dateObj = new Date(now.getFullYear(), now.getMonth(), d);
+        const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        for (let d = 1; d <= lastDay.getDate(); d++) {
             const btn = document.createElement('button');
             btn.className = 'spa-calendar-day';
-            btn.textContent = d.toString();
-            if (dateObj < new Date(now.getFullYear(), now.getMonth(), now.getDate())) {
+            btn.textContent = d;
+            if (new Date(now.getFullYear(), now.getMonth(), d) < todayMidnight) {
                 btn.disabled = true;
                 btn.classList.add('past');
             }
             btn.addEventListener('click', () => {
                 grid.querySelectorAll('.spa-calendar-day').forEach(b => b.classList.remove('selected'));
                 btn.classList.add('selected');
-                if (selectedDateLabel) selectedDateLabel.textContent = `Selected: ${d} ${monthNames[now.getMonth()]} ${now.getFullYear()}`;
+                if (selectedLabel) selectedLabel.textContent = `Selected: ${d} ${months[now.getMonth()]} ${now.getFullYear()}`;
             });
             grid.appendChild(btn);
         }
-        calendarContainer.appendChild(grid);
+        cal.appendChild(grid);
     }
 
     // ─── Theme ────────────────────────────────────────────────────────────────
@@ -512,8 +656,8 @@ document.addEventListener("DOMContentLoaded", function() {
     function updateThemeIcon() {
         const dark = body.classList.contains('dark-mode');
         themeToggle.innerHTML = dark
-            ? '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>'
-            : '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>';
+            ? '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>'
+            : '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
     }
 
     const storedDark = localStorage.getItem('darkMode');
@@ -527,35 +671,31 @@ document.addEventListener("DOMContentLoaded", function() {
         if (response.status === 200) {
             const text = await response.text();
             const blob = new Blob([text], { type: 'text/plain' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'conversation_history.txt';
-            a.click();
+            const url  = URL.createObjectURL(blob);
+            const a    = document.createElement('a');
+            a.href = url; a.download = 'conversation_history.txt'; a.click();
             URL.revokeObjectURL(url);
         } else {
             alert("Failed to download conversation history.");
         }
     });
 
-    // ─── Kokoro Voices ────────────────────────────────────────────────────────
+    // ─── Kokoro voices ────────────────────────────────────────────────────────
 
     fetch('/kokoro_voices')
         .then(r => r.json())
         .then(data => {
             const sel = document.getElementById('kokoro-voice-select');
             sel.innerHTML = '';
-            if (data.voices && data.voices.length > 0) {
-                data.voices.forEach(voice => {
+            if (data.voices?.length) {
+                data.voices.forEach(v => {
                     const opt = document.createElement('option');
-                    opt.value = voice.id;
-                    opt.text = voice.name;
+                    opt.value = v.id; opt.text = v.name;
                     sel.add(opt);
                 });
             } else {
                 const opt = document.createElement('option');
-                opt.value = 'af_bella';
-                opt.text = 'Select Kokoro TTS to Load';
+                opt.value = 'af_bella'; opt.text = 'Select Kokoro TTS to Load';
                 sel.add(opt);
             }
         })
@@ -563,8 +703,7 @@ document.addEventListener("DOMContentLoaded", function() {
             const sel = document.getElementById('kokoro-voice-select');
             sel.innerHTML = '';
             const opt = document.createElement('option');
-            opt.value = 'af_bella';
-            opt.text = 'Select Kokoro TTS to Load';
+            opt.value = 'af_bella'; opt.text = 'Select Kokoro TTS to Load';
             sel.add(opt);
         });
 

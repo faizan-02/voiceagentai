@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="default-character" content="{{ character_name }}">
+    <meta name="default-character" content="customer_support">
     <title>Voice Chat AI</title>
     <link rel="stylesheet" href="/app/static/css/styles.css">
     <link rel="icon" href="/app/static/favicon.ico" type="image/x-icon">
@@ -95,17 +95,6 @@
         </div>
     </header>
     <main>
-        <div id="cloud-notice" style="display:none;background:#1a3a2a;border:1px solid #2ecc71;color:#2ecc71;padding:10px 16px;border-radius:8px;margin:10px 16px;font-size:0.9rem;">
-            ☁️ Running in cloud mode — server-side mic is unavailable. Use the
-            <a href="/voice" style="color:#2ecc71;font-weight:bold;">Voice Page</a>
-            for full browser-based voice chat.
-        </div>
-        <script>
-            // Show cloud notice when not running locally
-            if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-                document.getElementById('cloud-notice').style.display = 'block';
-            }
-        </script>
         <div class="main-layout">
             <div id="conversation">
                 <div id="messages"></div>
@@ -301,11 +290,7 @@
     <script src="/app/static/js/scripts.js"></script>
     <script>
         document.addEventListener("DOMContentLoaded", function() {
-            // Characters are already loaded by scripts.js
-            // We only need to set the value here
-            setTimeout(() => {
-                document.getElementById('character-select').value = "{{ character_name }}";
-            }, 100);
+            // Default character is set via the meta tag read by scripts.js
 
             fetch('/elevenlabs_voices')
                 .then(response => response.json())
