@@ -1,5 +1,6 @@
 document.addEventListener("DOMContentLoaded", function() {
-    const websocket = new WebSocket(`ws://${window.location.hostname}:8000/ws`);
+    const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const websocket = new WebSocket(`${wsProto}://${window.location.host}/ws`);
     const themeToggle = document.getElementById('theme-toggle');
     const downloadButton = document.getElementById('download-button');
     const body = document.body;
@@ -13,13 +14,14 @@ document.addEventListener("DOMContentLoaded", function() {
     const providerSelect = document.getElementById('provider-select');
     const ttsSelect = document.getElementById('tts-select');
     const openaiVoiceSelect = document.getElementById('openai-voice-select');
-    
+    const statusBar = document.getElementById('status-bar');
+
     // Set initial TTS provider from server
     const initialTTS = ttsSelect.dataset.initial;
     if (initialTTS && initialTTS !== 'None' && initialTTS !== '') {
         ttsSelect.value = initialTTS;
     }
-    
+
     const elevenLabsVoiceSelect = document.getElementById('elevenlabs-voice-select');
     const kokoroVoiceSelect = document.getElementById('kokoro-voice-select');
     const openaiModelSelect = document.getElementById('openai-model-select');
@@ -31,181 +33,167 @@ document.addEventListener("DOMContentLoaded", function() {
     let aiMessageQueue = [];
     let isAISpeaking = false;
 
+    // Agent state: 'idle' | 'listening' | 'thinking' | 'speaking' | 'goodbye'
+    let agentState = 'idle';
+
     // Fetch and populate characters as soon as page loads
     fetchCharacters();
-    
+
     // Fetch Ollama models if that's the current provider
     if (providerSelect.value === 'ollama') {
         fetchOllamaModels();
     }
 
-    // Function to fetch available characters
-    async function fetchCharacters() {
-        try {
-            const response = await fetch('/characters');
-            if (response.ok) {
-                const data = await response.json();
-                populateCharacterSelect(data.characters);
-            } else {
-                console.error('Failed to fetch characters:', response.statusText);
-            }
-        } catch (error) {
-            console.error('Error fetching characters:', error);
-        }
+    // ─── State Management ───────────────────────────────────────────────────────
+
+    function setAgentState(state) {
+        agentState = state;
+        updateStatusBar();
+        updateButtonStates();
+        updateMicIcon();
     }
-    
-    // Function to fetch available Ollama models
-    async function fetchOllamaModels() {
-        try {
-            const response = await fetch('/ollama_models');
-            if (response.ok) {
-                const data = await response.json();
-                
-                if (data.error) {
-                    console.warn('Ollama API warning:', data.error);
-                }
-                
-                if (data.models && data.models.length > 0) {
-                    populateOllamaModelSelect(data.models);
-                } else {
-                    console.warn('No Ollama models found');
-                }
-            } else {
-                console.error('Failed to fetch Ollama models:', response.statusText);
-            }
-        } catch (error) {
-            console.error('Error fetching Ollama models:', error);
-        }
+
+    function updateStatusBar() {
+        if (!statusBar) return;
+        statusBar.className = 'status-bar status-' + agentState;
+        const icons = {
+            idle:      '○',
+            listening: '◉',
+            thinking:  '◌',
+            speaking:  '▶',
+            goodbye:   '✓'
+        };
+        const labels = {
+            idle:      'Ready — press Start to begin',
+            listening: 'Listening…',
+            thinking:  'Thinking…',
+            speaking:  'Speaking…',
+            goodbye:   'Conversation ended'
+        };
+        statusBar.innerHTML = `<span class="status-dot">${icons[agentState] || '○'}</span>
+                               <span class="status-label">${labels[agentState] || ''}</span>`;
     }
-    
-    // Function to populate Ollama model select dropdown
-    function populateOllamaModelSelect(models) {
-        // Save the current selection
-        const currentValue = ollamaModelSelect.value;
-        
-        // Clear the select element
-        ollamaModelSelect.innerHTML = '';
-        
-        // Sort the models alphabetically
-        models.sort((a, b) => a.localeCompare(b));
-        
-        // Add each model as an option
-        models.forEach(model => {
-            const option = document.createElement('option');
-            option.value = model;
-            option.textContent = model;
-            ollamaModelSelect.appendChild(option);
-        });
-        
-        // Try to restore the previous selection
-        if (models.includes(currentValue)) {
-            ollamaModelSelect.value = currentValue;
-        } else if (models.includes('llama3.2')) {
-            // Default to llama3.2 if available
-            ollamaModelSelect.value = 'llama3.2';
-        } else if (models.length > 0) {
-            // Otherwise select the first available model
-            ollamaModelSelect.value = models[0];
+
+    function updateButtonStates() {
+        const active = (agentState !== 'idle' && agentState !== 'goodbye');
+        startButton.disabled = active || !websocket || websocket.readyState !== WebSocket.OPEN;
+        stopButton.disabled  = !active;
+
+        startButton.classList.toggle('btn-active', !active);
+        stopButton.classList.toggle('btn-danger-active', active);
+    }
+
+    function updateMicIcon() {
+        micIcon.classList.remove('mic-on', 'mic-off', 'mic-waiting', 'pulse-animation');
+        if (agentState === 'listening') {
+            micIcon.classList.add('mic-on', 'pulse-animation');
+        } else if (agentState === 'thinking') {
+            micIcon.classList.add('mic-waiting');
+        } else if (agentState === 'speaking') {
+            micIcon.classList.add('mic-on');
+        } else {
+            micIcon.classList.add('mic-off');
         }
     }
 
-    // Function to populate character select dropdown
-    function populateCharacterSelect(characters) {
-        characterSelect.innerHTML = '';
-        
-        // Sort the characters alphabetically
-        characters.sort((a, b) => a.localeCompare(b));
-        
-        characters.forEach(character => {
-            const option = document.createElement('option');
-            option.value = character;
-            option.textContent = character.replace(/_/g, ' '); // Replace all underscores with spaces
-            characterSelect.appendChild(option);
-        });
-        
-        // Try to set the default character
-        const defaultCharacter = document.querySelector('meta[name="default-character"]')?.getAttribute('content');
-        if (defaultCharacter) {
-            characterSelect.value = defaultCharacter;
-        }
-    }
+    // ─── WebSocket ────────────────────────────────────────────────────────────
 
-    websocket.onopen = function(event) {
-        console.log("WebSocket is open now.");
-        startButton.disabled = false;
+    websocket.onopen = function() {
+        console.log("WebSocket open.");
+        setAgentState('idle');
     };
 
-    websocket.onclose = function(event) {
-        console.log("WebSocket is closed now.");
-        startButton.disabled = true;
+    websocket.onclose = function() {
+        console.log("WebSocket closed.");
+        setAgentState('idle');
     };
 
     websocket.onerror = function(event) {
-        console.error("WebSocket error observed:", event);
-        startButton.disabled = true;
+        console.error("WebSocket error:", event);
+        setAgentState('idle');
     };
 
     websocket.onmessage = function(event) {
         let data;
-        
-        // First check if the data is already a string that should be displayed directly
+
         if (typeof event.data === 'string' && !event.data.startsWith('{') && !event.data.startsWith('[')) {
             displayMessage(event.data);
             return;
         }
-        
-        // Try to parse as JSON
+
         try {
             data = JSON.parse(event.data);
-            console.log("Received message:", data);
         } catch (e) {
-            console.log("Received non-JSON message:", event.data);
-            // Don't treat this as an error if it's just a plain text message
             if (event.data && typeof event.data === 'string') {
                 displayMessage(event.data);
                 return;
             }
-            console.error("Error parsing JSON:", e);
             data = { message: event.data };
         }
 
         if (data.action === "ai_start_speaking") {
             isAISpeaking = true;
+            setAgentState('speaking');
             showVoiceAnimation();
             setTimeout(processQueuedMessages, 100);
+
         } else if (data.action === "ai_stop_speaking") {
             isAISpeaking = false;
             hideVoiceAnimation();
             processQueuedMessages();
+            // Go back to listening if conversation is still active
+            if (agentState === 'speaking') {
+                setAgentState('listening');
+            }
+
+        } else if (data.action === "thinking") {
+            setAgentState('thinking');
+            showThinkingIndicator();
+
+        } else if (data.action === "thinking_done") {
+            hideThinkingIndicator();
+            // State will be updated to 'speaking' when ai_start_speaking arrives
+
+        } else if (data.action === "conversation_ended") {
+            isAISpeaking = false;
+            hideVoiceAnimation();
+            hideThinkingIndicator();
+            hideListeningIndicator();
+            setAgentState('goodbye');
+            displayMessage(data.message || "Goodbye! Chat again soon.", 'goodbye-message');
+            // Reset to idle after a short delay
+            setTimeout(() => setAgentState('idle'), 3000);
+
         } else if (data.action === "error") {
-            console.error("Error from server:", data.message);
+            console.error("Server error:", data.message);
             displayMessage(data.message, 'error-message');
+
         } else if (data.action === "waiting_for_speech") {
-            // Show the listening indicator for waiting_for_speech action
+            setAgentState('listening');
             showListeningIndicator();
+
         } else if (data.message) {
             if (data.message.startsWith('You:')) {
+                setAgentState('thinking');
                 displayMessage(data.message);
-                // Hide the listening indicator when user's message is received
                 hideListeningIndicator();
             } else {
+                // Plain text from AI (displayed before or after speech)
                 aiMessageQueue.push(data.message);
                 if (!isAISpeaking) {
                     processQueuedMessages();
                 }
             }
+
         } else if (data.action === "recording_started") {
-            micIcon.classList.remove('mic-off');
-            micIcon.classList.add('mic-on');
-            micIcon.classList.add('pulse-animation');
-            // Show the listening indicator when recording starts
+            setAgentState('listening');
             showListeningIndicator();
+
         } else if (data.action === "recording_stopped") {
-            micIcon.classList.remove('mic-on');
-            micIcon.classList.remove('pulse-animation');
-            micIcon.classList.add('mic-off');
-            // Hide the listening indicator when recording stops
             hideListeningIndicator();
+            if (agentState === 'listening') {
+                setAgentState('thinking');
+            }
         }
     };
 
@@ -215,85 +203,66 @@ document.addEventListener("DOMContentLoaded", function() {
         }
     }
 
-    // Function to create and show the listening indicator with animated dots
+    // ─── Indicators ───────────────────────────────────────────────────────────
+
     function showListeningIndicator() {
-        // Remove any existing listening indicator
         hideListeningIndicator();
-        
-        // Create the listening indicator
-        const listeningIndicator = document.createElement('div');
-        listeningIndicator.className = "listening-indicator";
-        listeningIndicator.id = "listening-indicator";
-        
-        // Add the text
-        listeningIndicator.textContent = "Listening";
-        
-        // Create dots container
-        const dotsContainer = document.createElement('div');
-        dotsContainer.className = "listening-dots";
-        
-        // Create three animated dots
-        for (let i = 0; i < 3; i++) {
-            const dot = document.createElement('div');
-            dot.className = "dot";
-            dot.style.animationDelay = `${i * 0.2}s`;
-            dotsContainer.appendChild(dot);
-        }
-        
-        // Add dots to the indicator
-        listeningIndicator.appendChild(dotsContainer);
-        
-        // Add indicator to messages
-        messages.appendChild(listeningIndicator);
-        adjustScrollPosition();
-        
-        // Also add animation to mic icon
-        micIcon.classList.add('mic-waiting');
+        const el = document.createElement('div');
+        el.className = 'listening-indicator';
+        el.id = 'listening-indicator';
+        el.innerHTML = 'Listening <div class="listening-dots"><div class="dot"></div><div class="dot" style="animation-delay:0.2s"></div><div class="dot" style="animation-delay:0.4s"></div></div>';
+        messages.appendChild(el);
+        scrollToBottom();
     }
 
-    // Function to hide the listening indicator
     function hideListeningIndicator() {
-        const existingIndicator = document.getElementById('listening-indicator');
-        if (existingIndicator) {
-            existingIndicator.remove();
-        }
-        
-        // Remove animation from mic icon
-        micIcon.classList.remove('mic-waiting');
+        const el = document.getElementById('listening-indicator');
+        if (el) el.remove();
     }
 
-    function adjustScrollPosition() {
-        const conversation = document.getElementById('conversation');
-        if (isAISpeaking) {
-            // Add some buffer space to ensure animation is visible
-            conversation.scrollTop = conversation.scrollHeight - 250;
-        } else {
-            // When not speaking, scroll to bottom but leave some space
-            conversation.scrollTop = conversation.scrollHeight - 100;
-        }
+    function showThinkingIndicator() {
+        hideThinkingIndicator();
+        const el = document.createElement('div');
+        el.className = 'thinking-indicator';
+        el.id = 'thinking-indicator';
+        el.innerHTML = 'Thinking <div class="thinking-dots"><div class="dot"></div><div class="dot" style="animation-delay:0.2s"></div><div class="dot" style="animation-delay:0.4s"></div></div>';
+        messages.appendChild(el);
+        scrollToBottom();
     }
+
+    function hideThinkingIndicator() {
+        const el = document.getElementById('thinking-indicator');
+        if (el) el.remove();
+    }
+
+    // ─── Voice Animation ──────────────────────────────────────────────────────
 
     function showVoiceAnimation() {
         voiceAnimation.classList.remove('hidden');
-        adjustScrollPosition();
+        scrollToBottom();
     }
 
     function hideVoiceAnimation() {
         voiceAnimation.classList.add('hidden');
-        // Only scroll back to bottom with buffer after animation is hidden
         setTimeout(() => {
-            // Short delay to ensure smooth transition
-            adjustScrollPosition();
+            scrollToBottom();
             processQueuedMessages();
         }, 100);
     }
 
+    function scrollToBottom() {
+        const conversation = document.getElementById('conversation');
+        conversation.scrollTop = conversation.scrollHeight;
+    }
+
+    // ─── Message Display ─────────────────────────────────────────────────────
+
     function displayMessage(message, className = '') {
         let formattedMessage = message;
-        
+
         // Strip out <think>...</think> blocks
         formattedMessage = formattedMessage.replace(/<think>[\s\S]*?<\/think>/g, '');
-        
+
         const messageElement = document.createElement('div');
         if (className) {
             messageElement.className = className;
@@ -303,241 +272,171 @@ document.addEventListener("DOMContentLoaded", function() {
         } else {
             messageElement.className = 'ai-message';
         }
-        
-        // Handle code blocks
+
         if (formattedMessage.includes('```')) {
-            // Split by code blocks and process each segment
             let segments = formattedMessage.split(/(```(?:.*?)```)/gs);
             segments.forEach(segment => {
                 if (segment.startsWith('```') && segment.endsWith('```')) {
-                    // This is a code block
                     const codeContent = segment.slice(3, -3).trim();
-                    const preElement = document.createElement('pre');
-                    const codeElement = document.createElement('code');
-                    codeElement.textContent = codeContent;
-                    preElement.appendChild(codeElement);
-                    messageElement.appendChild(preElement);
+                    const pre = document.createElement('pre');
+                    const code = document.createElement('code');
+                    code.textContent = codeContent;
+                    pre.appendChild(code);
+                    messageElement.appendChild(pre);
                 } else if (segment.trim()) {
-                    // This is regular text
-                    // Handle newlines in regular text
                     segment.split('\n').forEach((line, index) => {
-                        if (index > 0) {
-                            messageElement.appendChild(document.createElement('br'));
-                        }
+                        if (index > 0) messageElement.appendChild(document.createElement('br'));
                         messageElement.appendChild(document.createTextNode(line));
                     });
                 }
             });
+        } else if (formattedMessage.includes('\n')) {
+            formattedMessage.split('\n').forEach((line, index) => {
+                if (index > 0) messageElement.appendChild(document.createElement('br'));
+                messageElement.appendChild(document.createTextNode(line));
+            });
         } else {
-            // Handle newlines in the message (no code blocks)
-            if (formattedMessage.includes('\n')) {
-                formattedMessage.split('\n').forEach((line, index) => {
-                    if (index > 0) {
-                        messageElement.appendChild(document.createElement('br'));
-                    }
-                    messageElement.appendChild(document.createTextNode(line));
-                });
-            } else {
-                messageElement.textContent = formattedMessage;
-            }
+            messageElement.textContent = formattedMessage;
         }
-        
+
         messages.appendChild(messageElement);
-        // Adjust scroll position whenever a message is added
-        setTimeout(() => adjustScrollPosition(), 10);
+        setTimeout(scrollToBottom, 10);
     }
+
+    // ─── Button Actions ───────────────────────────────────────────────────────
 
     startButton.addEventListener('click', function() {
         const selectedCharacter = document.getElementById('character-select').value;
         websocket.send(JSON.stringify({ action: "start", character: selectedCharacter }));
-        console.log("Start conversation message sent");
+        setAgentState('listening');
     });
 
     stopButton.addEventListener('click', function() {
         websocket.send(JSON.stringify({ action: "stop" }));
-        console.log("Stop conversation message sent");
+        stopButton.disabled = true;
+        // Fallback reset in case server doesn't send conversation_ended within 10s
+        setTimeout(() => {
+            if (agentState !== 'idle' && agentState !== 'goodbye') setAgentState('idle');
+        }, 10000);
     });
 
     clearButton.addEventListener('click', async function() {
         messages.innerHTML = '';
         try {
-            const response = await fetch('/clear_history', { method: 'POST' });
-            const data = await response.json();
-            console.log("Conversation history cleared.");
-            // Add a confirmation message
-            displayMessage("Conversation history has been cleared.", "system-message");
+            await fetch('/clear_history', { method: 'POST' });
+            displayMessage("Conversation history cleared.", "system-message");
         } catch (error) {
-            console.error("Error clearing history:", error);
             displayMessage("Error clearing conversation history", "error-message");
         }
     });
-    
 
-    messages.addEventListener('scroll', function() {
-        if (isAISpeaking) {
-            const conversation = document.getElementById('conversation');
-            const isScrolledToBottom = conversation.scrollHeight - conversation.clientHeight <= conversation.scrollTop + 1;
-            voiceAnimation.style.opacity = isScrolledToBottom ? '1' : '0';
-        }
-    });
+    // ─── Character & Settings ─────────────────────────────────────────────────
 
-    function setProvider() {
-        const provider = providerSelect.value;
-        websocket.send(JSON.stringify({ action: "set_provider", provider: provider }));
-        
-        // When Ollama is selected, fetch available models
-        if (provider === 'ollama') {
-            fetchOllamaModels();
-        }
+    function fetchCharacters() {
+        fetch('/characters')
+            .then(r => r.json())
+            .then(data => populateCharacterSelect(data.characters))
+            .catch(err => console.error('Error fetching characters:', err));
     }
 
-    function setTTS() {
-        const selectedTTS = document.getElementById('tts-select').value;
-        websocket.send(JSON.stringify({ action: "set_tts", tts: selectedTTS }));
+    function fetchOllamaModels() {
+        fetch('/ollama_models')
+            .then(r => r.json())
+            .then(data => {
+                if (data.models && data.models.length > 0) populateOllamaModelSelect(data.models);
+            })
+            .catch(err => console.error('Error fetching Ollama models:', err));
     }
 
-    function setOpenAIVoice() {
-        const selectedVoice = document.getElementById('openai-voice-select').value;
-        websocket.send(JSON.stringify({ action: "set_openai_voice", voice: selectedVoice }));
+    function populateOllamaModelSelect(models) {
+        const currentValue = ollamaModelSelect.value;
+        ollamaModelSelect.innerHTML = '';
+        models.sort((a, b) => a.localeCompare(b)).forEach(model => {
+            const opt = document.createElement('option');
+            opt.value = model;
+            opt.textContent = model;
+            ollamaModelSelect.appendChild(opt);
+        });
+        if (models.includes(currentValue)) ollamaModelSelect.value = currentValue;
+        else if (models.includes('llama3.2')) ollamaModelSelect.value = 'llama3.2';
+        else if (models.length > 0) ollamaModelSelect.value = models[0];
     }
 
-    function setOpenAIModel() {
-        const selectedModel = document.getElementById('openai-model-select').value;
-        websocket.send(JSON.stringify({ action: "set_openai_model", model: selectedModel }));
-    }
-
-    function setOllamaModel() {
-        const selectedModel = document.getElementById('ollama-model-select').value;
-        websocket.send(JSON.stringify({ action: "set_ollama_model", model: selectedModel }));
-    }
-
-    function setXAIModel() {
-        const selectedModel = document.getElementById('xai-model-select').value;
-        websocket.send(JSON.stringify({ action: "set_xai_model", model: selectedModel }));
-    }
-
-    function setAnthropicModel() {
-        const selectedModel = document.getElementById('anthropic-model-select').value;
-        websocket.send(JSON.stringify({ action: "set_anthropic_model", model: selectedModel }));
-    }
-
-    function setVoiceSpeed() {
-        const selectedSpeed = document.getElementById('voice-speed-select').value;
-        websocket.send(JSON.stringify({ action: "set_voice_speed", speed: selectedSpeed }));
-    }
-
-    function setElevenLabsVoice() {
-        const selectedVoice = document.getElementById('elevenlabs-voice-select').value;
-        websocket.send(JSON.stringify({ action: "set_elevenlabs_voice", voice: selectedVoice }));
-    }
-
-    function setKokoroVoice() {
-        const selectedVoice = document.getElementById('kokoro-voice-select').value;
-        websocket.send(JSON.stringify({ action: "set_kokoro_voice", voice: selectedVoice }));
+    function populateCharacterSelect(characters) {
+        characterSelect.innerHTML = '';
+        characters.sort((a, b) => a.localeCompare(b)).forEach(character => {
+            const opt = document.createElement('option');
+            opt.value = character;
+            opt.textContent = character.replace(/_/g, ' ');
+            characterSelect.appendChild(opt);
+        });
+        const defaultCharacter = document.querySelector('meta[name="default-character"]')?.getAttribute('content');
+        if (defaultCharacter) characterSelect.value = defaultCharacter;
+        toggleSpaSidebar(characterSelect.value);
     }
 
     characterSelect.addEventListener('change', function() {
         const selectedCharacter = this.value;
-        console.log(`Character selected: ${selectedCharacter}`);
-        
-        // Clear existing conversation display
+        toggleSpaSidebar(selectedCharacter);
         messages.innerHTML = '';
-        
-        // Set the selected character
+
         fetch('/set_character', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ character: selectedCharacter })
         })
-        .then(response => response.json())
+        .then(r => r.json())
         .then(data => {
-            console.log('Character set response:', data);
-            
-            // Check if this is a story/game character and fetch history
             if (selectedCharacter.startsWith('story_') || selectedCharacter.startsWith('game_')) {
-                // Fetch history for this character
                 fetch('/get_character_history')
-                    .then(response => response.json())
+                    .then(r => r.json())
                     .then(historyData => {
                         if (historyData.status === 'success' && historyData.history) {
-                            // Display the history
-                            const historyLines = historyData.history.split('\n');
-                            let currentSpeaker = null;
-                            let currentMessage = '';
-                            
-                            // Process each line
-                            historyLines.forEach(line => {
+                            const lines = historyData.history.split('\n');
+                            let speaker = null, msg = '';
+                            lines.forEach(line => {
                                 if (line.startsWith('User:')) {
-                                    // Display previous message if exists
-                                    if (currentSpeaker && currentMessage) {
-                                        if (currentSpeaker === 'User') {
-                                            displayMessage(`You: ${currentMessage}`);
-                                        } else {
-                                            displayMessage(currentMessage);
-                                        }
-                                    }
-                                    
-                                    // Start new user message
-                                    currentSpeaker = 'User';
-                                    currentMessage = line.substring(5).trim();
+                                    if (speaker && msg) displayMessage(speaker === 'User' ? `You: ${msg}` : msg);
+                                    speaker = 'User'; msg = line.substring(5).trim();
                                 } else if (line.startsWith('Assistant:')) {
-                                    // Display previous message if exists
-                                    if (currentSpeaker && currentMessage) {
-                                        if (currentSpeaker === 'User') {
-                                            displayMessage(`You: ${currentMessage}`);
-                                        } else {
-                                            displayMessage(currentMessage);
-                                        }
-                                    }
-                                    
-                                    // Start new assistant message
-                                    currentSpeaker = 'Assistant';
-                                    currentMessage = line.substring(10).trim();
-                                } else if (line.trim() && currentSpeaker) {
-                                    // Continuation of current message
-                                    currentMessage += '\n' + line;
+                                    if (speaker && msg) displayMessage(speaker === 'User' ? `You: ${msg}` : msg);
+                                    speaker = 'Assistant'; msg = line.substring(10).trim();
+                                } else if (line.trim() && speaker) {
+                                    msg += '\n' + line;
                                 }
                             });
-                            
-                            // Display the last message
-                            if (currentSpeaker && currentMessage) {
-                                if (currentSpeaker === 'User') {
-                                    displayMessage(`You: ${currentMessage}`);
-                                } else {
-                                    displayMessage(currentMessage);
-                                }
-                            }
-                            
-                            // Add a note that this is previous history
-                            displayMessage(`Previous conversation history loaded for ${selectedCharacter.replace('_', ' ')}. Press Start to continue.`, "system-message");
-                            
-                            // Scroll to bottom to show latest messages
-                            conversation.scrollTop = conversation.scrollHeight;
+                            if (speaker && msg) displayMessage(speaker === 'User' ? `You: ${msg}` : msg);
+                            displayMessage(`History loaded for ${selectedCharacter.replace(/_/g, ' ')}. Press Start to continue.`, 'system-message');
+                            scrollToBottom();
                         }
-                    })
-                    .catch(error => {
-                        console.error('Error fetching character history:', error);
                     });
             }
         })
-        .catch(error => console.error('Error setting character:', error));
+        .catch(err => console.error('Error setting character:', err));
     });
 
+    // ─── Settings Listeners ───────────────────────────────────────────────────
+
+    function setProvider() {
+        const provider = providerSelect.value;
+        websocket.send(JSON.stringify({ action: "set_provider", provider }));
+        if (provider === 'ollama') fetchOllamaModels();
+    }
+
     providerSelect.addEventListener('change', setProvider);
-    ttsSelect.addEventListener('change', setTTS);
-    openaiVoiceSelect.addEventListener('change', setOpenAIVoice);
-    openaiModelSelect.addEventListener('change', setOpenAIModel);
-    ollamaModelSelect.addEventListener('change', setOllamaModel);
-    xaiModelSelect.addEventListener('change', setXAIModel);
+    ttsSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_tts", tts: ttsSelect.value })));
+    openaiVoiceSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_openai_voice", voice: openaiVoiceSelect.value })));
+    openaiModelSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_openai_model", model: openaiModelSelect.value })));
+    ollamaModelSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_ollama_model", model: ollamaModelSelect.value })));
+    xaiModelSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_xai_model", model: xaiModelSelect.value })));
+    voiceSpeedSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_voice_speed", speed: voiceSpeedSelect.value })));
+    elevenLabsVoiceSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_elevenlabs_voice", voice: elevenLabsVoiceSelect.value })));
+    kokoroVoiceSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_kokoro_voice", voice: kokoroVoiceSelect.value })));
+
     const anthropicModelSelect = document.getElementById('anthropic-model-select');
     if (anthropicModelSelect) {
-        anthropicModelSelect.addEventListener('change', setAnthropicModel);
+        anthropicModelSelect.addEventListener('change', () => websocket.send(JSON.stringify({ action: "set_anthropic_model", model: anthropicModelSelect.value })));
     }
-    voiceSpeedSelect.addEventListener('change', setVoiceSpeed);
-    elevenLabsVoiceSelect.addEventListener('change', setElevenLabsVoice);
-    kokoroVoiceSelect.addEventListener('change', setKokoroVoice);
 
     transcriptionSelect.addEventListener('change', function() {
         fetch('/set_transcription_model', {
@@ -547,11 +446,87 @@ document.addEventListener("DOMContentLoaded", function() {
         });
     });
 
-    async function downloadHistory() {
+    // ─── Spa Sidebar ──────────────────────────────────────────────────────────
+
+    function toggleSpaSidebar(selectedCharacter) {
+        const spaSidebar = document.getElementById('spa-sidebar');
+        if (!spaSidebar) return;
+        if (selectedCharacter === 'customer_support') {
+            spaSidebar.classList.remove('hidden');
+            buildSpaCalendar();
+        } else {
+            spaSidebar.classList.add('hidden');
+        }
+    }
+
+    function buildSpaCalendar() {
+        const calendarContainer = document.getElementById('spa-calendar');
+        const todayLabel = document.getElementById('spa-today');
+        if (!calendarContainer || !todayLabel) return;
+        const now = new Date();
+        const monthNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+        todayLabel.textContent = `Today: ${now.getDate()} ${monthNames[now.getMonth()]} ${now.getFullYear()}`;
+        calendarContainer.innerHTML = '';
+        const selectedDateLabel = document.getElementById('spa-selected-date');
+        const end = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+        const header = document.createElement('div');
+        header.className = 'spa-calendar-header';
+        header.textContent = `${monthNames[now.getMonth()]} ${now.getFullYear()}`;
+        calendarContainer.appendChild(header);
+        const grid = document.createElement('div');
+        grid.className = 'spa-calendar-grid';
+        const firstDay = new Date(now.getFullYear(), now.getMonth(), 1).getDay();
+        for (let i = 0; i < (firstDay === 0 ? 6 : firstDay - 1); i++) {
+            const empty = document.createElement('button');
+            empty.className = 'spa-calendar-day empty';
+            empty.disabled = true;
+            grid.appendChild(empty);
+        }
+        for (let d = 1; d <= end.getDate(); d++) {
+            const dateObj = new Date(now.getFullYear(), now.getMonth(), d);
+            const btn = document.createElement('button');
+            btn.className = 'spa-calendar-day';
+            btn.textContent = d.toString();
+            if (dateObj < new Date(now.getFullYear(), now.getMonth(), now.getDate())) {
+                btn.disabled = true;
+                btn.classList.add('past');
+            }
+            btn.addEventListener('click', () => {
+                grid.querySelectorAll('.spa-calendar-day').forEach(b => b.classList.remove('selected'));
+                btn.classList.add('selected');
+                if (selectedDateLabel) selectedDateLabel.textContent = `Selected: ${d} ${monthNames[now.getMonth()]} ${now.getFullYear()}`;
+            });
+            grid.appendChild(btn);
+        }
+        calendarContainer.appendChild(grid);
+    }
+
+    // ─── Theme ────────────────────────────────────────────────────────────────
+
+    themeToggle.addEventListener('click', function() {
+        body.classList.toggle('dark-mode');
+        updateThemeIcon();
+        localStorage.setItem('darkMode', body.classList.contains('dark-mode'));
+    });
+
+    function updateThemeIcon() {
+        const dark = body.classList.contains('dark-mode');
+        themeToggle.innerHTML = dark
+            ? '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>'
+            : '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>';
+    }
+
+    const storedDark = localStorage.getItem('darkMode');
+    if (storedDark !== null) body.classList.toggle('dark-mode', storedDark === 'true');
+    updateThemeIcon();
+
+    // ─── Download ─────────────────────────────────────────────────────────────
+
+    downloadButton.addEventListener('click', async function() {
         const response = await fetch('/download_history');
         if (response.status === 200) {
-            const historyText = await response.text();
-            const blob = new Blob([historyText], { type: 'text/plain' });
+            const text = await response.text();
+            const blob = new Blob([text], { type: 'text/plain' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -561,83 +536,39 @@ document.addEventListener("DOMContentLoaded", function() {
         } else {
             alert("Failed to download conversation history.");
         }
-    }
-
-    downloadButton.addEventListener('click', downloadHistory);
-    
-    // Theme toggle functionality
-    function setDarkModeDefault() {
-        const isDarkMode = localStorage.getItem('darkMode');
-        if (isDarkMode === null) {
-            body.classList.add('dark-mode');
-        } else {
-            body.classList.toggle('dark-mode', isDarkMode === 'true');
-        }
-        updateThemeIcon();
-    }
-
-    themeToggle.addEventListener('click', function() {
-        body.classList.toggle('dark-mode');
-        updateThemeIcon();
-        saveThemePreference();
     });
 
-    function updateThemeIcon() {
-        const isDarkMode = body.classList.contains('dark-mode');
-        themeToggle.innerHTML = isDarkMode 
-            ? '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-sun"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>'
-            : '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-moon"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>';
-    }
+    // ─── Kokoro Voices ────────────────────────────────────────────────────────
 
-    function saveThemePreference() {
-        const isDarkMode = body.classList.contains('dark-mode');
-        localStorage.setItem('darkMode', isDarkMode);
-    }
-
-    function loadThemePreference() {
-        const isDarkMode = localStorage.getItem('darkMode') === 'true';
-        body.classList.toggle('dark-mode', isDarkMode);
-        updateThemeIcon();
-    }
-
-    loadThemePreference();
-    setDarkModeDefault();
-
-    // Fetch Kokoro voices
     fetch('/kokoro_voices')
-        .then(response => response.json())
+        .then(r => r.json())
         .then(data => {
-            const voiceSelect = document.getElementById('kokoro-voice-select');
-            
-            // Clear any existing options
-            voiceSelect.innerHTML = '';
-            
-            // If we have voices, populate the dropdown with them
+            const sel = document.getElementById('kokoro-voice-select');
+            sel.innerHTML = '';
             if (data.voices && data.voices.length > 0) {
-                // Populate with available voices
                 data.voices.forEach(voice => {
-                    const option = document.createElement('option');
-                    option.value = voice.id;
-                    option.text = voice.name;
-                    voiceSelect.add(option);
+                    const opt = document.createElement('option');
+                    opt.value = voice.id;
+                    opt.text = voice.name;
+                    sel.add(opt);
                 });
             } else {
-                // If no voices are available, add a placeholder
-                const placeholderOption = document.createElement('option');
-                placeholderOption.value = 'af_bella';
-                placeholderOption.text = 'Select Kokoro TTS to Load';
-                voiceSelect.add(placeholderOption);
+                const opt = document.createElement('option');
+                opt.value = 'af_bella';
+                opt.text = 'Select Kokoro TTS to Load';
+                sel.add(opt);
             }
         })
-        .catch(error => {
-            console.error('Error fetching Kokoro voices:', error);
-            
-            // On error, ensure we have a placeholder
-            const voiceSelect = document.getElementById('kokoro-voice-select');
-            voiceSelect.innerHTML = '';
-            const placeholderOption = document.createElement('option');
-            placeholderOption.value = 'af_bella';
-            placeholderOption.text = 'Select Kokoro TTS to Load';
-            voiceSelect.add(placeholderOption);
+        .catch(() => {
+            const sel = document.getElementById('kokoro-voice-select');
+            sel.innerHTML = '';
+            const opt = document.createElement('option');
+            opt.value = 'af_bella';
+            opt.text = 'Select Kokoro TTS to Load';
+            sel.add(opt);
         });
+
+    // ─── Init ─────────────────────────────────────────────────────────────────
+
+    setAgentState('idle');
 });
