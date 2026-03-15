@@ -40,18 +40,18 @@ document.addEventListener("DOMContentLoaded", function() {
     let audioResponseReceived = false;
     let checkInTimer          = null;  // independent silence check-in timer
     let vadReady              = false; // true once AudioContext has had time to warm up
-    const CHECK_IN_MS         = 10000; // ms of silence before "are you still there?"
+    const CHECK_IN_MS         = 15000; // ms of silence before "are you still there?"
 
     // Booking state — synced between voice and UI
     // services is an array: [{ name, price, duration }, ...]
     let bookingDetails = { date: null, time: null, services: [] };
 
     // VAD tuning
-    const SILENCE_THRESHOLD   = 10;   // 10/255 — catches soft speech and phone numbers
-    const SILENCE_DURATION_MS = 2500; // ms of continuous silence before submitting (allows pauses mid-phrase)
-    const MIN_SPEECH_CHUNKS   = 4;    // minimum 400ms of detected speech before submitting
-    const MAX_RECORD_MS       = 25000; // hard cut-off — allow time for names + long phone numbers
-    const MIN_AUDIO_BYTES     = 1500;  // reject blobs smaller than this (near-silence artefacts)
+    const SILENCE_THRESHOLD   = 18;   // peak bin threshold (0-255) — max-bin detection is far more sensitive than avg
+    const SILENCE_DURATION_MS = 2500; // ms of continuous silence before submitting
+    const MIN_SPEECH_CHUNKS   = 3;    // minimum 300ms of detected speech before submitting
+    const MAX_RECORD_MS       = 25000; // hard cut-off
+    const MIN_AUDIO_BYTES     = 1500;  // reject near-silence blobs
     let silenceStart  = null;
     let speechChunks  = 0;
     let hasSpeech     = false;
@@ -265,6 +265,11 @@ document.addEventListener("DOMContentLoaded", function() {
     function startRecording() {
         if (!mediaStream || !isConversationActive) return;
 
+        // Ensure AudioContext is running — browsers can suspend it between turns
+        if (audioContext && audioContext.state !== 'running') {
+            audioContext.resume().catch(() => {});
+        }
+
         audioChunks    = [];
         hasSpeech      = false;
         silenceStart   = null;
@@ -316,16 +321,24 @@ document.addEventListener("DOMContentLoaded", function() {
     function checkVAD() {
         if (!analyser || !isConversationActive || !vadReady) return;
 
+        // If the AudioContext was suspended by the browser, wake it up.
+        // While suspended getByteFrequencyData returns all-zeros → VAD is blind.
+        if (audioContext && audioContext.state !== 'running') {
+            audioContext.resume().catch(() => {});
+            return; // skip this tick; will be fine next tick
+        }
+
         const buf = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteFrequencyData(buf);
 
-        let sum = 0;
-        for (let i = 0; i < buf.length; i++) sum += buf[i];
-        const avg = sum / buf.length;
+        // Use the PEAK bin value (not the average).
+        // Speech energy concentrates in a few bins — peak is far more sensitive than avg.
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) { if (buf[i] > peak) peak = buf[i]; }
 
         const now = Date.now();
 
-        if (avg > SILENCE_THRESHOLD) {
+        if (peak > SILENCE_THRESHOLD) {
             silenceStart = null;
             hasSpeech    = true;
             speechChunks++;
@@ -336,7 +349,6 @@ document.addEventListener("DOMContentLoaded", function() {
                     submitRecording();
                 }
             } else if (now - recordingStart > MAX_RECORD_MS) {
-                // No speech at all in this window — restart listening quietly
                 submitRecording();
             }
         }
