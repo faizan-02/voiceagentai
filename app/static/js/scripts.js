@@ -1039,11 +1039,30 @@ document.addEventListener("DOMContentLoaded", function() {
             rows.push([label, detail]);
         });
 
+        // Calculate total cost from service prices
+        if (bookingDetails.services.length > 0) {
+            let total = 0;
+            let hasFrom = false;
+            bookingDetails.services.forEach(s => {
+                if (!s.price) return;
+                const priceStr = s.price.toLowerCase();
+                if (priceStr.includes('from')) hasFrom = true;
+                // Extract first number from price string (e.g. "from 4,000 PKR" → 4000)
+                const match = priceStr.replace(/,/g, '').match(/\d+/);
+                if (match) total += parseInt(match[0], 10);
+            });
+            if (total > 0) {
+                const formatted = total.toLocaleString('en-PK') + ' PKR';
+                rows.push(['Total', hasFrom ? `from ${formatted}` : formatted]);
+            }
+        }
+
         if (rows.length === 0) return;
 
-        content.innerHTML = rows.map(([label, value]) =>
-            `<div class="summary-row"><span class="summary-label">${label}</span><span class="summary-value">${value}</span></div>`
-        ).join('');
+        content.innerHTML = rows.map(([label, value]) => {
+            const extraClass = label === 'Total' ? ' total-row' : '';
+            return `<div class="summary-row${extraClass}"><span class="summary-label">${label}</span><span class="summary-value">${value}</span></div>`;
+        }).join('');
 
         section.style.display = '';
         section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
