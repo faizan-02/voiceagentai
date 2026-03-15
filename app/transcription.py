@@ -9,7 +9,10 @@ import wave
 import numpy as np
 import aiohttp
 import tempfile
-from faster_whisper import WhisperModel
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
 from dotenv import load_dotenv
 
 # Import torch only if available (needed for CUDA detection)
