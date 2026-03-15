@@ -35,25 +35,25 @@ document.addEventListener("DOMContentLoaded", function() {
     let audioChunks          = [];
     let audioContext         = null;
     let analyser             = null;
-    let vadTimer             = null;
+    let vadTimer             = null;  // kept for compat with stopVAD()
+    let vadActive            = false; // chunk-based VAD gate
     let isConversationActive = false;
     let currentAudio         = null;
     let audioResponseReceived = false;
-    let checkInTimer          = null;  // independent silence check-in timer
-    let vadReady              = false; // true once AudioContext has had time to warm up
-    const CHECK_IN_MS         = 15000; // ms of silence before "are you still there?"
+    let checkInTimer          = null;
+    let vadReady              = false; // suppressed during echo dead-zone after AI speaks
+    const CHECK_IN_MS         = 15000;
 
-    // Booking state — synced between voice and UI
-    // services is an array: [{ name, price, duration }, ...]
+    // Booking state
     let bookingDetails = { date: null, time: null, services: [] };
 
-    // VAD tuning  (time-domain RMS, 0–128 scale)
-    const SILENCE_THRESHOLD   = 6;    // RMS units — silence ~0-3, whisper ~4-7, normal speech 8+
-    const SILENCE_DURATION_MS = 2500; // ms of continuous silence before submitting
-    const MIN_SPEECH_CHUNKS   = 5;    // 500ms of sustained speech required — filters echo/noise bursts
-    const MAX_RECORD_MS       = 25000; // hard cut-off
-    const MIN_AUDIO_BYTES     = 1500;  // reject near-silence blobs
-    const ECHO_DEAD_ZONE_MS   = 1500; // ms after AI audio ends before VAD activates
+    // VAD tuning — chunk-size based (opus encodes silence tiny, speech large)
+    const SPEECH_CHUNK_BYTES  = 400;  // bytes/100ms: silence~50-250, speech~400+
+    const SILENCE_DURATION_MS = 2000; // ms of sub-threshold chunks before submitting
+    const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech-sized chunks before we consider it real
+    const MAX_RECORD_MS       = 8000; // hard cut-off — submit after 8s regardless
+    const MIN_AUDIO_BYTES     = 1000; // reject blobs that are clearly empty
+    const ECHO_DEAD_ZONE_MS   = 1500; // ms post-AI-speech before VAD activates
     let silenceStart  = null;
     let speechChunks  = 0;
     let hasSpeech     = false;
@@ -293,11 +293,6 @@ document.addEventListener("DOMContentLoaded", function() {
     function startRecording() {
         if (!mediaStream || !isConversationActive) return;
 
-        // Ensure AudioContext is running — browsers can suspend it between turns
-        if (audioContext && audioContext.state !== 'running') {
-            audioContext.resume().catch(() => {});
-        }
-
         audioChunks    = [];
         hasSpeech      = false;
         silenceStart   = null;
@@ -311,13 +306,37 @@ document.addEventListener("DOMContentLoaded", function() {
             mediaRecorder = new MediaRecorder(mediaStream);
         }
 
-        mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+        let chunkIndex = 0;
+        vadActive = true;
+
+        mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) audioChunks.push(e.data);
+            if (!vadActive || !vadReady || !isConversationActive) return;
+
+            chunkIndex++;
+            if (chunkIndex <= 2) return; // skip first 200ms — WebM container header is oversized
+
+            const now = Date.now();
+
+            // Opus chunk-size VAD:
+            // Silence compresses to ~50-250 bytes/100ms; speech compresses to 400+ bytes.
+            // This works regardless of AudioContext state, mic gain, or browser version.
+            if (e.data.size >= SPEECH_CHUNK_BYTES) {
+                silenceStart = null;
+                hasSpeech    = true;
+                speechChunks++;
+            } else {
+                if (hasSpeech) {
+                    if (!silenceStart) silenceStart = now;
+                    if (now - silenceStart > SILENCE_DURATION_MS) submitRecording();
+                } else if (now - recordingStart > MAX_RECORD_MS) {
+                    submitRecording();
+                }
+            }
+        };
+
         mediaRecorder.start(100);
 
-        // VAD polling every 100ms
-        vadTimer = setInterval(checkVAD, 100);
-
-        // Start silence check-in timer from the moment we begin listening
         if (vadReady) resetCheckInTimer();
     }
 
@@ -343,45 +362,6 @@ document.addEventListener("DOMContentLoaded", function() {
             mediaRecorder.stop();
         } else {
             websocket.send(JSON.stringify({ action: "check_in" }));
-        }
-    }
-
-    function checkVAD() {
-        if (!analyser || !isConversationActive || !vadReady) return;
-
-        // Resume a browser-suspended AudioContext before reading data
-        if (audioContext && audioContext.state !== 'running') {
-            audioContext.resume().catch(() => {});
-            return; // skip this tick — context will be running next poll
-        }
-
-        // Time-domain RMS: measures actual amplitude, not FFT bins.
-        // Works reliably across all sample rates and mic sensitivities.
-        const buf = new Uint8Array(analyser.fftSize);
-        analyser.getByteTimeDomainData(buf);
-
-        let sumSq = 0;
-        for (let i = 0; i < buf.length; i++) {
-            const diff = buf[i] - 128; // 128 = midpoint (silence)
-            sumSq += diff * diff;
-        }
-        const rms = Math.sqrt(sumSq / buf.length); // 0 = silence, ~8-30 = normal speech
-
-        const now = Date.now();
-
-        if (rms > SILENCE_THRESHOLD) {
-            silenceStart = null;
-            hasSpeech    = true;
-            speechChunks++;
-        } else {
-            if (hasSpeech) {
-                if (!silenceStart) silenceStart = now;
-                if (now - silenceStart > SILENCE_DURATION_MS) {
-                    submitRecording();
-                }
-            } else if (now - recordingStart > MAX_RECORD_MS) {
-                submitRecording();
-            }
         }
     }
 
@@ -430,6 +410,7 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function stopVAD() {
+        vadActive = false;
         if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
     }
 
