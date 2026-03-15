@@ -8,70 +8,43 @@
     <link rel="stylesheet" href="/app/static/css/styles.css">
     <link rel="icon" href="/app/static/favicon.ico" type="image/x-icon">
     <style>
-        /* ── Layout: chat panel + sidebar side-by-side ── */
-        .main-layout {
-            display: flex;
-            flex-direction: row;
-            gap: 16px;
-            align-items: flex-start;
-            padding: 0 16px;
-        }
-
+        /* chat-panel is the left grid column: stacks controls → status → conversation */
         .chat-panel {
-            flex: 1 1 0;
-            min-width: 0;
             display: flex;
             flex-direction: column;
             gap: 8px;
+            min-width: 0;
         }
+        /* Remove default bottom margins from children inside chat-panel */
+        .chat-panel .controls      { margin-bottom: 0; }
+        .chat-panel .status-bar    { margin-bottom: 0; }
+        .chat-panel #conversation  { margin-bottom: 0; }
 
-        /* ── Controls (Start / End / Clear) ── */
-        .controls {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            margin: 0;
-        }
-
-        /* ── Status bar sits just above the conversation ── */
-        #status-bar {
-            margin: 0;
-        }
-
-        /* ── Settings collapsed below everything ── */
-        .settings {
-            padding: 10px 16px 16px;
-        }
-
+        /* Settings toggle button */
         .settings-toggle {
             background: none;
-            border: 1px solid var(--border-color, #444);
+            border: 1px solid var(--border);
             border-radius: 6px;
-            color: inherit;
+            color: var(--text-muted);
             cursor: pointer;
-            font-size: 0.85rem;
-            padding: 6px 14px;
-            margin: 8px 16px 0;
-            opacity: 0.7;
+            font-size: 0.82rem;
+            font-weight: 500;
+            padding: 5px 14px;
+            margin-bottom: 0.5rem;
+            max-width: none;
+            flex-grow: 0;
+            align-self: flex-start;
         }
-        .settings-toggle:hover { opacity: 1; }
-        .settings-body { display: none; }
-        .settings-body.open { display: flex; flex-wrap: wrap; gap: 8px; }
+        .settings-toggle:hover { color: var(--text); border-color: var(--primary); }
 
-        /* ── Mobile ── */
+        /* Settings body hidden/shown */
+        .settings.hidden { display: none; }
+
         @media (max-width: 768px) {
-            .main-layout { flex-direction: column; padding: 0 8px; }
-            header { flex-direction: column; padding: 10px 5px; }
-            .header-controls { margin-top: 10px; width: 100%; justify-content: space-between; display: flex; flex-direction: row; }
-            .header-controls .button-group { display: flex; gap: 10px; margin-left: 10px; }
-            .header-controls .main-nav { margin-left: 0; margin-right: 5px; }
+            .chat-panel { gap: 6px; }
         }
-        @media (max-width: 480px) {
-            body { font-size: 14px; }
-            h1   { font-size: 1.3rem; }
-        }
-        .header-controls #theme-toggle    { margin-top: 12px; }
-        .header-controls #download-button { margin-top: 12px; }
+        .header-controls #theme-toggle    { margin-top: 0; }
+        .header-controls #download-button { margin-top: 0; }
     </style>
 </head>
 <body class="dark-mode">
@@ -81,14 +54,14 @@
             <div id="mic-icon" class="mic-off">&#x1F399;</div>
         </h1>
         <div class="header-controls">
-            <div class="button-group">
+            <div class="button-group" style="display:flex;gap:8px;align-items:center;">
                 <button id="theme-toggle" aria-label="Toggle dark/light mode">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
                     </svg>
                 </button>
                 <button id="download-button" aria-label="Download conversation history" title="Download conversation history">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                         <polyline points="7 10 12 15 17 10"></polyline>
                         <line x1="12" y1="15" x2="12" y2="3"></line>
@@ -106,49 +79,47 @@
     </header>
 
     <main>
+        <!-- Two-column grid (defined in styles.css: 2.2fr / 1.4fr) -->
         <div class="main-layout">
 
-            <!-- Left: chat panel (conversation + buttons) -->
+            <!-- Left column: controls → status → conversation -->
             <div class="chat-panel">
-                <!-- Controls at the top of the chat panel -->
                 <div class="controls">
                     <button id="start-conversation-btn" class="btn-start btn-active">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:6px"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:5px"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                         Start
                     </button>
                     <button id="stop-conversation-btn" class="btn-stop" disabled>
-                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:6px"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+                        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:5px"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
                         End
                     </button>
                     <button id="clear-conversation-btn" class="btn-clear">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:6px"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:5px"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
                         Clear
                     </button>
                 </div>
 
-                <!-- Status bar -->
                 <div id="status-bar" class="status-bar status-idle">
                     <span class="status-dot">○</span>
                     <span class="status-label">Ready — press Start to begin</span>
                 </div>
 
-                <!-- Conversation messages -->
                 <div id="conversation">
                     <div id="messages"></div>
                     <div id="voice-animation" class="hidden">
                         <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                            <circle cx="50" cy="50" r="45" fill="none" stroke="currentColor" stroke-width="8" />
+                            <circle cx="50" cy="50" r="45" fill="none" stroke="currentColor" stroke-width="8"/>
                             <g id="voice-bars">
-                                <rect x="30" y="35" width="8" height="30" rx="4" />
-                                <rect x="46" y="25" width="8" height="50" rx="4" />
-                                <rect x="62" y="35" width="8" height="30" rx="4" />
+                                <rect x="30" y="35" width="8" height="30" rx="4"/>
+                                <rect x="46" y="25" width="8" height="50" rx="4"/>
+                                <rect x="62" y="35" width="8" height="30" rx="4"/>
                             </g>
                         </svg>
                     </div>
                 </div>
             </div>
 
-            <!-- Right: spa sidebar (only shown for customer_support) -->
+            <!-- Right column: spa sidebar (only shown for customer_support) -->
             <aside id="spa-sidebar" class="spa-sidebar hidden">
                 <h2>Islamabad Spa Salon</h2>
                 <p class="spa-tagline">Bookings, prices, and availability with Sara.</p>
@@ -203,15 +174,15 @@
 
         </div><!-- /.main-layout -->
 
-        <!-- Settings (collapsed by default) -->
+        <!-- Settings (collapsible) -->
         <button class="settings-toggle" id="settings-toggle-btn">⚙ Settings</button>
-        <div class="settings settings-body" id="settings-body">
+        <div class="settings hidden" id="settings-body">
             <div class="setting-group">
-                <label for="character-select">Character:</label>
+                <label for="character-select">Character</label>
                 <select id="character-select"></select>
             </div>
             <div class="setting-group">
-                <label for="provider-select">Model Provider:</label>
+                <label for="provider-select">Model Provider</label>
                 <select id="provider-select">
                     <option value="openai">OpenAI</option>
                     <option value="ollama">Ollama</option>
@@ -220,7 +191,7 @@
                 </select>
             </div>
             <div class="setting-group">
-                <label for="tts-select">TTS Provider:</label>
+                <label for="tts-select">TTS Provider</label>
                 <select id="tts-select" data-initial="{{ tts_provider }}">
                     <option value="openai">OpenAI</option>
                     <option value="elevenlabs">ElevenLabs</option>
@@ -229,7 +200,7 @@
                 </select>
             </div>
             <div class="setting-group">
-                <label for="openai-voice-select">OpenAI Voice:</label>
+                <label for="openai-voice-select">OpenAI Voice</label>
                 <select id="openai-voice-select">
                     <option value="alloy">Alloy - female</option>
                     <option value="echo">Echo - male</option>
@@ -243,35 +214,35 @@
                 </select>
             </div>
             <div class="setting-group">
-                <label for="elevenlabs-voice-select">ElevenLabs Voice:</label>
+                <label for="elevenlabs-voice-select">ElevenLabs Voice</label>
                 <select id="elevenlabs-voice-select"></select>
             </div>
             <div class="setting-group">
-                <label for="kokoro-voice-select">Kokoro Voice:</label>
+                <label for="kokoro-voice-select">Kokoro Voice</label>
                 <select id="kokoro-voice-select"></select>
             </div>
             <div class="setting-group">
-                <label for="openai-model-select">OpenAI Model:</label>
+                <label for="openai-model-select">OpenAI Model</label>
                 <select id="openai-model-select">
                     <option value="gpt-4o">GPT-4o</option>
                     <option value="gpt-4o-mini">GPT-4o-mini</option>
                 </select>
             </div>
             <div class="setting-group">
-                <label for="ollama-model-select">Ollama Model:</label>
+                <label for="ollama-model-select">Ollama Model</label>
                 <select id="ollama-model-select">
                     <option value="llama3.2">Select Ollama to Load</option>
                 </select>
             </div>
             <div class="setting-group">
-                <label for="xai-model-select">XAI Model:</label>
+                <label for="xai-model-select">XAI Model</label>
                 <select id="xai-model-select">
                     <option value="grok-2-1212">Grok 2-1212</option>
                     <option value="grok-3">Grok 3</option>
                 </select>
             </div>
             <div class="setting-group">
-                <label for="anthropic-model-select">Anthropic Model:</label>
+                <label for="anthropic-model-select">Anthropic Model</label>
                 <select id="anthropic-model-select">
                     <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
                     <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
@@ -279,7 +250,7 @@
                 </select>
             </div>
             <div class="setting-group">
-                <label for="voice-speed-select">Voice Speed:</label>
+                <label for="voice-speed-select">Voice Speed</label>
                 <select id="voice-speed-select">
                     <option value="0.7">0.7</option>
                     <option value="0.9">0.9</option>
@@ -289,7 +260,7 @@
                 </select>
             </div>
             <div class="setting-group">
-                <label for="transcription-select">Transcription:</label>
+                <label for="transcription-select">Transcription</label>
                 <select id="transcription-select">
                     {% if faster_whisper_local %}
                     <option value="local_whisper" selected>Local Faster Whisper</option>
@@ -304,7 +275,7 @@
                     {% endif %}
                 </select>
             </div>
-        </div>
+        </div><!-- /#settings-body -->
     </main>
 
     <footer>
@@ -315,10 +286,12 @@
     <script>
         // Settings toggle
         document.getElementById('settings-toggle-btn').addEventListener('click', function() {
-            const body = document.getElementById('settings-body');
-            body.classList.toggle('open');
-            this.textContent = body.classList.contains('open') ? '✕ Close Settings' : '⚙ Settings';
+            const s = document.getElementById('settings-body');
+            const open = s.classList.toggle('hidden') === false;
+            this.textContent = open ? '✕ Close Settings' : '⚙ Settings';
         });
+        // Fix toggle: starts hidden, so first click opens
+        // (hidden class is on by default above)
 
         document.addEventListener("DOMContentLoaded", function() {
             fetch('/elevenlabs_voices')
@@ -328,7 +301,7 @@
                     const def = document.createElement('option');
                     def.value = ''; def.text = 'Default Voice';
                     sel.add(def);
-                    data.voices.forEach(v => {
+                    (data.voices || []).forEach(v => {
                         const opt = document.createElement('option');
                         opt.value = v.id; opt.text = v.name;
                         sel.add(opt);
@@ -336,12 +309,12 @@
                     sel.value = "{{ elevenlabs_voice }}";
                 }).catch(() => {});
 
-            document.getElementById('provider-select').value   = "{{ model_provider }}";
-            document.getElementById('tts-select').value        = "{{ tts_provider }}";
+            document.getElementById('provider-select').value    = "{{ model_provider }}";
+            document.getElementById('tts-select').value         = "{{ tts_provider }}";
             document.getElementById('openai-voice-select').value = "{{ openai_tts_voice }}";
             document.getElementById('openai-model-select').value = "{{ openai_model }}";
             document.getElementById('ollama-model-select').value = "{{ ollama_model }}";
-            document.getElementById('voice-speed-select').value = "{{ voice_speed }}";
+            document.getElementById('voice-speed-select').value  = "{{ voice_speed }}";
 
             setTimeout(() => {
                 const k = document.getElementById('kokoro-voice-select');
