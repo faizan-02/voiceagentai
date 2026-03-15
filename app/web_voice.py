@@ -5,6 +5,7 @@ Protocol (browser ↔ server):
   Browser → Server:
     {"action": "start",  "character": "sara", "model": "gpt-4o", "voice": "nova"}
     {"action": "audio",  "data": "<base64_webm_audio>"}
+    {"action": "text",   "text": "user text message (e.g. date selected from calendar)"}
     {"action": "stop"}
 
   Server → Browser:
@@ -280,6 +281,54 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 except Exception as exc:
                     logger.warning("ws_voice: check_in TTS error: %s", exc)
                     await send({"action": "listening"})
+
+            # ------------------------------------------------------------------
+            # "text" — browser sends a direct text message (e.g. calendar date)
+            # Skips transcription; goes straight into LLM → TTS pipeline
+            # ------------------------------------------------------------------
+            elif action == "text":
+                user_text = message.get("text", "").strip()
+                if not user_text:
+                    await send({"action": "listening"})
+                    continue
+
+                await send({"action": "transcript", "text": user_text})
+                await send({"action": "thinking"})
+
+                prompt_path = _character_prompt_path(character)
+                try:
+                    system_msg = open_file(prompt_path)
+                except Exception:
+                    system_msg = f"You are {character.capitalize()}, a helpful AI assistant."
+
+                try:
+                    loop = asyncio.get_event_loop()
+                    ai_response: str = await loop.run_in_executor(
+                        None, chatgpt_streamed, user_text, system_msg, "", history,
+                    )
+                except Exception as exc:
+                    logger.error("ws_voice: text action LLM error: %s", exc)
+                    await send({"action": "error", "message": f"LLM error: {exc}"})
+                    await send({"action": "listening"})
+                    continue
+
+                clean_response = sanitize_response(ai_response)
+                history.append({"role": "user", "content": user_text})
+                history.append({"role": "assistant", "content": clean_response})
+
+                try:
+                    mp3_bytes = await _tts_to_mp3(clean_response, voice)
+                    audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
+                except Exception as exc:
+                    logger.error("ws_voice: text action TTS error: %s", exc)
+                    await send({"action": "response_text", "text": clean_response})
+                    await send({"action": "error", "message": f"TTS error: {exc}"})
+                    await send({"action": "done"})
+                    continue
+
+                await send({"action": "response_text", "text": clean_response})
+                await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
+                await send({"action": "done"})
 
             else:
                 await send({"action": "error", "message": f"Unknown action: {action}"})

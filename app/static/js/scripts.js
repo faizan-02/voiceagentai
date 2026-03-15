@@ -680,7 +680,27 @@ document.addEventListener("DOMContentLoaded", function() {
             btn.addEventListener('click', () => {
                 grid.querySelectorAll('.spa-calendar-day').forEach(b => b.classList.remove('selected'));
                 btn.classList.add('selected');
-                if (selectedLabel) selectedLabel.textContent = `Selected: ${d} ${months[now.getMonth()]} ${now.getFullYear()}`;
+                const dateStr = `${d} ${months[now.getMonth()]} ${now.getFullYear()}`;
+                if (selectedLabel) selectedLabel.textContent = `Selected: ${dateStr}`;
+
+                // If a conversation is active, notify the AI about the selected date
+                if (isConversationActive && websocket && websocket.readyState === WebSocket.OPEN) {
+                    // Stop current recording/VAD so the AI can respond
+                    stopVAD();
+                    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                        mediaRecorder.onstop = () => { audioChunks = []; };
+                        mediaRecorder.stop();
+                    }
+                    clearTimeout(checkInTimer);
+
+                    // Send date as a text message — AI responds contextually
+                    const textMsg = `I've selected ${dateStr} on the calendar.`;
+                    displayMessage(textMsg, 'user-message');
+                    hideListeningIndicator();
+                    setAgentState('thinking');
+                    showThinkingIndicator();
+                    websocket.send(JSON.stringify({ action: "text", text: textMsg }));
+                }
             });
             grid.appendChild(btn);
         }
