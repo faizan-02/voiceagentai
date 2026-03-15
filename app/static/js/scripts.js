@@ -50,9 +50,10 @@ document.addEventListener("DOMContentLoaded", function() {
     // VAD tuning  (time-domain RMS, 0–128 scale)
     const SILENCE_THRESHOLD   = 6;    // RMS units — silence ~0-3, whisper ~4-7, normal speech 8+
     const SILENCE_DURATION_MS = 2500; // ms of continuous silence before submitting
-    const MIN_SPEECH_CHUNKS   = 3;    // minimum 300 ms of detected speech before submitting
+    const MIN_SPEECH_CHUNKS   = 5;    // 500ms of sustained speech required — filters echo/noise bursts
     const MAX_RECORD_MS       = 25000; // hard cut-off
     const MIN_AUDIO_BYTES     = 1500;  // reject near-silence blobs
+    const ECHO_DEAD_ZONE_MS   = 1500; // ms after AI audio ends before VAD activates
     let silenceStart  = null;
     let speechChunks  = 0;
     let hasSpeech     = false;
@@ -202,12 +203,18 @@ document.addEventListener("DOMContentLoaded", function() {
             case "error": {
                 const msg = data.message || "An error occurred.";
                 console.error("Server error:", msg);
-                displayMessage(`⚠ ${msg}`, 'error-message');
+                const isAudioQualityErr = msg.toLowerCase().includes('corrupted') ||
+                                          msg.toLowerCase().includes('unsupported') ||
+                                          msg.toLowerCase().includes("didn't catch");
+                if (!isAudioQualityErr) {
+                    displayMessage(`⚠ ${msg}`, 'error-message');
+                }
                 hideThinkingIndicator();
                 hideListeningIndicator();
                 hideVoiceAnimation();
                 if (isConversationActive) {
-                    setTimeout(startNextTurn, 1500);
+                    // Shorter delay for audio quality errors — just restart quietly
+                    setTimeout(startNextTurn, isAudioQualityErr ? 400 : 1500);
                 }
                 break;
             }
@@ -242,6 +249,7 @@ document.addEventListener("DOMContentLoaded", function() {
     function startNextTurn() {
         if (!isConversationActive) return;
         if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+        if (currentAudio) return; // audio still playing — onended will call us
         audioResponseReceived = false;
         setAgentState('listening');
         showListeningIndicator();
@@ -451,42 +459,36 @@ document.addEventListener("DOMContentLoaded", function() {
         currentAudio = new Audio(url);
         currentAudio.playbackRate = parseFloat(voiceSpeedSelect.value) || 1.0;
 
-        currentAudio.onended = () => {
-            URL.revokeObjectURL(url);
+        function afterAudioEnds() {
             currentAudio = null;
             hideVoiceAnimation();
-            // ── Echo dead-zone ──────────────────────────────────────────────
-            // After AI finishes speaking, room reverb can linger 200-500ms.
-            // Suppress VAD for 700ms so we don't submit echo audio to Whisper
-            // (echo produces empty transcripts → "thinking 1-2s → listening" loop).
+            // Echo dead-zone: suppress VAD for ECHO_DEAD_ZONE_MS after AI speech ends.
+            // Room reverb / speaker echo would trigger false speech detection without this.
             vadReady = false;
-            startNextTurn();          // starts MediaRecorder immediately (captures real audio)
+            startNextTurn(); // MediaRecorder starts now, VAD stays off until dead-zone expires
             setTimeout(() => {
                 if (isConversationActive) {
                     vadReady = true;
                     if (agentState === 'listening') resetCheckInTimer();
                 }
-            }, 700);
+            }, ECHO_DEAD_ZONE_MS);
+        }
+
+        currentAudio.onended = () => {
+            URL.revokeObjectURL(url);
+            afterAudioEnds();
         };
 
         currentAudio.onerror = (e) => {
             console.error("Playback error:", e);
             URL.revokeObjectURL(url);
-            currentAudio = null;
-            hideVoiceAnimation();
-            vadReady = false;
-            startNextTurn();
-            setTimeout(() => { if (isConversationActive) { vadReady = true; if (agentState === 'listening') resetCheckInTimer(); } }, 700);
+            afterAudioEnds();
         };
 
         currentAudio.play().catch(e => {
             console.error("play() rejected:", e);
             URL.revokeObjectURL(url);
-            currentAudio = null;
-            hideVoiceAnimation();
-            vadReady = false;
-            startNextTurn();
-            setTimeout(() => { if (isConversationActive) { vadReady = true; if (agentState === 'listening') resetCheckInTimer(); } }, 700);
+            afterAudioEnds();
         });
     }
 
