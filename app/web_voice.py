@@ -25,13 +25,14 @@ import os
 import tempfile
 
 import aiohttp
+from openai import AsyncOpenAI
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from .app import (
     OPENAI_API_KEY,
+    OPENAI_TTS_VOICE,
     chatgpt_streamed,
     open_file,
-    openai_text_to_speech,
     sanitize_response,
 )
 
@@ -50,6 +51,18 @@ CHARACTERS_DIR = os.path.join(
 
 def _character_prompt_path(character: str) -> str:
     return os.path.join(CHARACTERS_DIR, character, f"{character}.txt")
+
+
+async def _tts_to_mp3(text: str, voice: str) -> bytes:
+    """Generate TTS via OpenAI SDK and return raw MP3 bytes (no file I/O, no PyAudio)."""
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    response = await client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice=voice,
+        input=text,
+        response_format="mp3",
+    )
+    return response.content
 
 
 async def _transcribe_webm(audio_bytes: bytes, filename: str = "audio.webm") -> str:
@@ -95,7 +108,7 @@ async def ws_voice_endpoint(websocket: WebSocket):
     # Per-connection state
     character: str = "wizard"
     model: str = "gpt-4o-mini"
-    voice: str = "alloy"
+    voice: str = OPENAI_TTS_VOICE or "nova"
     history: list = []
 
     # Temp files created during this session (cleaned up on disconnect)
@@ -227,45 +240,22 @@ async def ws_voice_endpoint(websocket: WebSocket):
 
                 await send({"action": "response_text", "text": clean_response})
 
-                # 8. TTS → temp wav file
-                tmp_tts = tempfile.NamedTemporaryFile(
-                    suffix=".wav", delete=False
-                )
-                tmp_tts.close()
-                temp_files.append(tmp_tts.name)
-
+                # 8. TTS → MP3 bytes directly via OpenAI SDK (no file I/O, no PyAudio)
                 try:
-                    # openai_text_to_speech is an async coroutine
-                    await openai_text_to_speech(clean_response, tmp_tts.name)
+                    mp3_bytes = await _tts_to_mp3(clean_response, voice)
+                    audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
+                    await send(
+                        {
+                            "action": "audio_response",
+                            "data": audio_b64,
+                            "format": "mp3",
+                        }
+                    )
                 except Exception as exc:
                     logger.error("ws_voice: TTS error: %s", exc)
                     await send({"action": "error", "message": f"TTS error: {exc}"})
                     await send({"action": "done"})
                     continue
-                finally:
-                    pass  # cleanup below
-
-                # 9. Read wav bytes → base64 → send
-                try:
-                    with open(tmp_tts.name, "rb") as f:
-                        wav_bytes = f.read()
-                    audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
-                    await send(
-                        {
-                            "action": "audio_response",
-                            "data": audio_b64,
-                            "format": "wav",
-                        }
-                    )
-                except Exception as exc:
-                    logger.error("ws_voice: failed to read/send TTS output: %s", exc)
-                    await send({"action": "error", "message": f"Audio send error: {exc}"})
-                finally:
-                    try:
-                        os.unlink(tmp_tts.name)
-                        temp_files.remove(tmp_tts.name)
-                    except Exception:
-                        pass
 
                 # 10. Signal end of this turn
                 await send({"action": "done"})

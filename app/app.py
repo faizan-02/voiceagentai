@@ -268,6 +268,9 @@ async def play_audio(file_path):
 
 def sync_play_audio(file_path):
     global playback_state
+    if not PYAUDIO_AVAILABLE:
+        print("sync_play_audio: PyAudio not available (cloud deployment) — skipping playback")
+        return
     print("Starting audio playback")
     playback_state = "speaking"
     file_extension = Path(file_path).suffix.lstrip('.').lower()
