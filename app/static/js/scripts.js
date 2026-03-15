@@ -43,7 +43,8 @@ document.addEventListener("DOMContentLoaded", function() {
     const CHECK_IN_MS         = 10000; // ms of silence before "are you still there?"
 
     // Booking state — synced between voice and UI
-    let bookingDetails = { date: null, time: null, service: null, servicePrice: null, serviceDuration: null };
+    // services is an array: [{ name, price, duration }, ...]
+    let bookingDetails = { date: null, time: null, services: [] };
 
     // VAD tuning
     const SILENCE_THRESHOLD   = 10;   // 10/255 — catches soft speech and phone numbers
@@ -208,7 +209,7 @@ document.addEventListener("DOMContentLoaded", function() {
             case "booking_update":
                 // Server extracted date/service/time from user speech — sync the UI
                 if (data.date)    { bookingDetails.date = data.date; syncCalendarDate(data.date); }
-                if (data.service) { bookingDetails.service = data.service; bookingDetails.servicePrice = data.service_price || null; bookingDetails.serviceDuration = data.service_duration || null; syncServiceSelection(data.service); }
+                if (data.service) { syncServiceSelection(data.service, data.service_price || '', data.service_duration || ''); }
                 if (data.time)    { bookingDetails.time = data.time; syncTimeSelection(data.time); }
                 break;
 
@@ -476,9 +477,11 @@ document.addEventListener("DOMContentLoaded", function() {
         setAgentState('goodbye');
         displayMessage("Conversation ended.", 'goodbye-message');
         setTimeout(() => setAgentState('idle'), 3000);
-        bookingDetails = { date: null, time: null, service: null, servicePrice: null, serviceDuration: null };
+        bookingDetails = { date: null, time: null, services: [] };
         document.querySelectorAll('.spa-service-item').forEach(i => i.classList.remove('selected'));
         document.querySelectorAll('.spa-time-slot').forEach(i => i.classList.remove('selected'));
+        const doneWrap = document.getElementById('service-done-wrap');
+        if (doneWrap) doneWrap.style.display = 'none';
         const summarySection = document.getElementById('booking-summary-section');
         if (summarySection) summarySection.style.display = 'none';
     });
@@ -747,40 +750,67 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function setupServiceItemClicks() {
+        const doneWrap = document.getElementById('service-done-wrap');
+        const doneBtn  = document.getElementById('service-done-btn');
+
+        function refreshDoneVisibility() {
+            if (doneWrap) doneWrap.style.display = bookingDetails.services.length > 0 ? '' : 'none';
+        }
+
         document.querySelectorAll('.spa-service-item').forEach(item => {
             item.addEventListener('click', function() {
-                // Visually select
-                document.querySelectorAll('.spa-service-item').forEach(i => i.classList.remove('selected'));
-                this.classList.add('selected');
-
-                const svc = this.dataset.service;
-                const price = this.dataset.price || '';
+                const svc      = this.dataset.service;
+                const price    = this.dataset.price || '';
                 const duration = this.dataset.duration || '';
 
-                bookingDetails.service = svc;
-                bookingDetails.servicePrice = price;
-                bookingDetails.serviceDuration = duration || null;
-
-                // If conversation is active, notify AI
-                if (isConversationActive && websocket && websocket.readyState === WebSocket.OPEN) {
-                    stopVAD();
-                    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                        mediaRecorder.onstop = () => { audioChunks = []; };
-                        mediaRecorder.stop();
-                    }
-                    clearTimeout(checkInTimer);
-
-                    const msg = duration
-                        ? `I'd like to book the ${svc} (${duration}, ${price}).`
-                        : `I'd like to book the ${svc} (${price}).`;
-                    displayMessage(msg, 'user-message');
-                    hideListeningIndicator();
-                    setAgentState('thinking');
-                    showThinkingIndicator();
-                    websocket.send(JSON.stringify({ action: "text", text: msg }));
+                const idx = bookingDetails.services.findIndex(s => s.name === svc);
+                if (idx === -1) {
+                    // Add to selection
+                    this.classList.add('selected');
+                    bookingDetails.services.push({ name: svc, price, duration: duration || null });
+                } else {
+                    // Deselect
+                    this.classList.remove('selected');
+                    bookingDetails.services.splice(idx, 1);
                 }
+                refreshDoneVisibility();
             });
         });
+
+        if (doneBtn) {
+            // Remove any previously attached listener to avoid duplicates
+            const newBtn = doneBtn.cloneNode(true);
+            doneBtn.parentNode.replaceChild(newBtn, doneBtn);
+
+            newBtn.addEventListener('click', function() {
+                if (bookingDetails.services.length === 0) return;
+                if (!isConversationActive || !websocket || websocket.readyState !== WebSocket.OPEN) return;
+
+                stopVAD();
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.onstop = () => { audioChunks = []; };
+                    mediaRecorder.stop();
+                }
+                clearTimeout(checkInTimer);
+
+                // Build a single message listing all selected services
+                const lines = bookingDetails.services.map(s =>
+                    s.duration ? `${s.name} (${s.duration}, ${s.price})` : `${s.name} (${s.price})`
+                );
+                const msg = lines.length === 1
+                    ? `I'd like to book the ${lines[0]}.`
+                    : `I'd like to book the following services: ${lines.join(', ')}.`;
+
+                displayMessage(msg, 'user-message');
+                hideListeningIndicator();
+                setAgentState('thinking');
+                showThinkingIndicator();
+                websocket.send(JSON.stringify({ action: "text", text: msg }));
+
+                // Hide the Done button after confirming
+                if (doneWrap) doneWrap.style.display = 'none';
+            });
+        }
     }
 
     function buildSpaCalendar() {
@@ -927,14 +957,17 @@ document.addEventListener("DOMContentLoaded", function() {
         });
     }
 
-    function syncServiceSelection(serviceName) {
-        // Highlight the matching service item in the sidebar
-        document.querySelectorAll('.spa-service-item').forEach(item => {
-            item.classList.remove('selected');
-            if (item.dataset.service === serviceName) {
-                item.classList.add('selected');
-            }
-        });
+    function syncServiceSelection(serviceName, price, duration) {
+        // Add to multi-select if not already present
+        const item = document.querySelector(`.spa-service-item[data-service="${CSS.escape(serviceName)}"]`);
+        if (!item) return;
+        const already = bookingDetails.services.some(s => s.name === serviceName);
+        if (!already) {
+            item.classList.add('selected');
+            bookingDetails.services.push({ name: serviceName, price: price || item.dataset.price || '', duration: duration || item.dataset.duration || null });
+        }
+        const doneWrap = document.getElementById('service-done-wrap');
+        if (doneWrap) doneWrap.style.display = bookingDetails.services.length > 0 ? '' : 'none';
     }
 
     function showBookingSummary() {
@@ -943,11 +976,15 @@ document.addEventListener("DOMContentLoaded", function() {
         if (!section || !content) return;
 
         const rows = [];
-        if (bookingDetails.date)            rows.push(['Date',     bookingDetails.date]);
-        if (bookingDetails.time)            rows.push(['Time',     bookingDetails.time]);
-        if (bookingDetails.service)         rows.push(['Service',  bookingDetails.service]);
-        if (bookingDetails.servicePrice)    rows.push(['Price',    bookingDetails.servicePrice]);
-        if (bookingDetails.serviceDuration) rows.push(['Duration', bookingDetails.serviceDuration]);
+        if (bookingDetails.date) rows.push(['Date', bookingDetails.date]);
+        if (bookingDetails.time) rows.push(['Time', bookingDetails.time]);
+        bookingDetails.services.forEach((s, i) => {
+            const label = bookingDetails.services.length > 1 ? `Service ${i + 1}` : 'Service';
+            let detail = s.name;
+            if (s.duration) detail += ` (${s.duration})`;
+            if (s.price)    detail += ` — ${s.price}`;
+            rows.push([label, detail]);
+        });
 
         if (rows.length === 0) return;
 
