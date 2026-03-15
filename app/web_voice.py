@@ -249,27 +249,37 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 history.append({"role": "user", "content": transcript})
                 history.append({"role": "assistant", "content": clean_response})
 
-                await send({"action": "response_text", "text": clean_response})
-
-                # 8. TTS → MP3 bytes directly via OpenAI SDK (no file I/O, no PyAudio)
+                # 8. Generate TTS FIRST so text + audio arrive together (no visible gap)
                 try:
                     mp3_bytes = await _tts_to_mp3(clean_response, voice)
                     audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
-                    await send(
-                        {
-                            "action": "audio_response",
-                            "data": audio_b64,
-                            "format": "mp3",
-                        }
-                    )
                 except Exception as exc:
                     logger.error("ws_voice: TTS error: %s", exc)
+                    # Send text even if TTS fails
+                    await send({"action": "response_text", "text": clean_response})
                     await send({"action": "error", "message": f"TTS error: {exc}"})
                     await send({"action": "done"})
                     continue
 
-                # 10. Signal end of this turn
+                # 9. Send text and audio back-to-back so they appear simultaneously
+                await send({"action": "response_text", "text": clean_response})
+                await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
                 await send({"action": "done"})
+
+            # ------------------------------------------------------------------
+            # "check_in" — browser detected prolonged silence; Sara prompts
+            # ------------------------------------------------------------------
+            elif action == "check_in":
+                check_text = "Are you still there? Take your time — I'm listening."
+                try:
+                    mp3_bytes = await _tts_to_mp3(check_text, voice)
+                    audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
+                    await send({"action": "response_text", "text": check_text})
+                    await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
+                    await send({"action": "done"})
+                except Exception as exc:
+                    logger.warning("ws_voice: check_in TTS error: %s", exc)
+                    await send({"action": "listening"})
 
             else:
                 await send({"action": "error", "message": f"Unknown action: {action}"})

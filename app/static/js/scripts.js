@@ -27,17 +27,19 @@ document.addEventListener("DOMContentLoaded", function() {
     if (initialTTS && initialTTS !== 'None' && initialTTS !== '') ttsSelect.value = initialTTS;
 
     // ─── Runtime state ────────────────────────────────────────────────────────
-    let agentState          = 'idle';
-    let websocket           = null;
-    let mediaStream         = null;
-    let mediaRecorder       = null;
-    let audioChunks         = [];
-    let audioContext        = null;
-    let analyser            = null;
-    let vadTimer            = null;
+    let agentState           = 'idle';
+    let websocket            = null;
+    let mediaStream          = null;
+    let mediaRecorder        = null;
+    let audioChunks          = [];
+    let audioContext         = null;
+    let analyser             = null;
+    let vadTimer             = null;
     let isConversationActive = false;
-    let currentAudio        = null;
+    let currentAudio         = null;
     let audioResponseReceived = false;
+    let noSpeechCycles       = 0;      // consecutive silent recording rounds
+    const NO_SPEECH_CHECKIN  = 2;      // rounds before "are you still there?"
 
     // VAD tuning
     const SILENCE_THRESHOLD   = 8;    // avg frequency amplitude (0-255 scale) — low = sensitive
@@ -290,11 +292,12 @@ document.addEventListener("DOMContentLoaded", function() {
 
         mediaRecorder.onstop = async () => {
             if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
-                // Encode and send to server
-                const blob       = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-                const arrayBuf   = await blob.arrayBuffer();
-                const base64     = arrayBufferToBase64(arrayBuf);
-                audioChunks = [];
+                // Speech detected — reset silence counter and send audio
+                noSpeechCycles = 0;
+                const blob     = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                const arrayBuf = await blob.arrayBuffer();
+                const base64   = arrayBufferToBase64(arrayBuf);
+                audioChunks    = [];
 
                 if (websocket && websocket.readyState === WebSocket.OPEN) {
                     hideListeningIndicator();
@@ -303,9 +306,15 @@ document.addEventListener("DOMContentLoaded", function() {
                     websocket.send(JSON.stringify({ action: "audio", data: base64 }));
                 }
             } else {
-                // Too short / no speech — restart listening
+                // No speech this round
                 audioChunks = [];
-                if (isConversationActive) {
+                noSpeechCycles++;
+                if (noSpeechCycles >= NO_SPEECH_CHECKIN && isConversationActive &&
+                    websocket && websocket.readyState === WebSocket.OPEN) {
+                    // Trigger Sara's "are you still there?" prompt
+                    noSpeechCycles = 0;
+                    websocket.send(JSON.stringify({ action: "check_in" }));
+                } else if (isConversationActive) {
                     startNextTurn();
                 }
             }
@@ -385,6 +394,7 @@ document.addEventListener("DOMContentLoaded", function() {
         if (!ok) return;
 
         isConversationActive = true;
+        noSpeechCycles = 0;
         setAgentState('listening');
         connectWebSocket();
     });
