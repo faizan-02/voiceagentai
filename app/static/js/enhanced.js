@@ -29,13 +29,13 @@ document.addEventListener("DOMContentLoaded", function() {
     let isConversationActive   = false;
     let currentAudio           = null;
     let audioResponseReceived  = false;
-    let lastSpeechTime          = 0;
+    let checkInTimer            = null;
     const CHECK_IN_MS           = 10000;
 
-    // VAD tuning (same as scripts.js)
-    const SILENCE_THRESHOLD    = 8;
+    // VAD tuning
+    const SILENCE_THRESHOLD    = 20;   // raised — filters background noise
     const SILENCE_DURATION_MS  = 1800;
-    const MIN_SPEECH_CHUNKS    = 2;
+    const MIN_SPEECH_CHUNKS    = 3;    // 300ms confirmed speech required
     const MAX_RECORD_MS        = 12000;
     let silenceStart   = null;
     let speechChunks   = 0;
@@ -196,6 +196,28 @@ document.addEventListener("DOMContentLoaded", function() {
         vadTimer = setInterval(checkVAD, 100);
     }
 
+    // ── Check-in timer (independent of VAD) ──────────────────────────────────
+
+    function resetCheckInTimer() {
+        clearTimeout(checkInTimer);
+        if (!isConversationActive) return;
+        checkInTimer = setTimeout(fireCheckIn, CHECK_IN_MS);
+    }
+
+    function fireCheckIn() {
+        if (!isConversationActive || !websocket || websocket.readyState !== WebSocket.OPEN) return;
+        stopVAD();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.onstop = () => {
+                audioChunks = [];
+                websocket.send(JSON.stringify({ action: "check_in" }));
+            };
+            mediaRecorder.stop();
+        } else {
+            websocket.send(JSON.stringify({ action: "check_in" }));
+        }
+    }
+
     function checkVAD() {
         if (!analyser || !isConversationActive) return;
         const buf = new Uint8Array(analyser.frequencyBinCount);
@@ -207,24 +229,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
         if (avg > SILENCE_THRESHOLD) {
             silenceStart = null; hasSpeech = true; speechChunks++;
-            // lastSpeechTime updated only on confirmed speech in submitRecording
         } else {
-            // Fire check-in immediately once 10s of silence detected (no speech this round)
-            if (!hasSpeech && lastSpeechTime > 0 && now - lastSpeechTime > CHECK_IN_MS) {
-                lastSpeechTime = now;
-                stopVAD();
-                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                    mediaRecorder.onstop = () => {
-                        audioChunks = [];
-                        if (isConversationActive && websocket && websocket.readyState === WebSocket.OPEN) {
-                            websocket.send(JSON.stringify({ action: "check_in" }));
-                        }
-                    };
-                    mediaRecorder.stop();
-                }
-                return;
-            }
-
             if (hasSpeech) {
                 if (!silenceStart) silenceStart = now;
                 if (now - silenceStart > SILENCE_DURATION_MS) submitRecording();
@@ -240,7 +245,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
         mediaRecorder.onstop = async () => {
             if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
-                lastSpeechTime = Date.now();
+                resetCheckInTimer();
                 const blob   = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
                 const ab     = await blob.arrayBuffer();
                 const b64    = arrayBufferToBase64(ab);
@@ -294,7 +299,7 @@ document.addEventListener("DOMContentLoaded", function() {
         currentAudio.onended = () => {
             URL.revokeObjectURL(url); currentAudio = null;
             hideVoiceAnim();
-            lastSpeechTime = Date.now(); // reset silence clock after AI finishes speaking
+            resetCheckInTimer(); // restart 10s clock after AI finishes speaking
             nextTurn();
         };
         currentAudio.onerror = () => {
@@ -311,13 +316,14 @@ document.addEventListener("DOMContentLoaded", function() {
         const ok = await initMic();
         if (!ok) return;
         isConversationActive = true;
-        lastSpeechTime = Date.now();
         setStatus('listening');
         connectWebSocket();
+        resetCheckInTimer();
     });
 
     stopBtn.addEventListener('click', function() {
         isConversationActive = false;
+        clearTimeout(checkInTimer);
         stopVAD(); stopRecording();
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
         if (websocket && websocket.readyState === WebSocket.OPEN) {

@@ -38,13 +38,13 @@ document.addEventListener("DOMContentLoaded", function() {
     let isConversationActive = false;
     let currentAudio         = null;
     let audioResponseReceived = false;
-    let lastSpeechTime        = 0;     // wall-clock ms of last confirmed speech (not noise)
+    let checkInTimer          = null;  // independent silence check-in timer
     const CHECK_IN_MS         = 10000; // ms of silence before "are you still there?"
 
     // VAD tuning
-    const SILENCE_THRESHOLD   = 8;    // avg frequency amplitude (0-255 scale) — low = sensitive
+    const SILENCE_THRESHOLD   = 20;   // raised from 8 — filters out background hiss/noise
     const SILENCE_DURATION_MS = 1800; // ms of continuous silence before submitting
-    const MIN_SPEECH_CHUNKS   = 2;    // minimum 100ms chunks with detected speech
+    const MIN_SPEECH_CHUNKS   = 3;    // minimum 300ms of detected speech before submitting
     const MAX_RECORD_MS       = 12000; // hard cut-off — submit after 12 s no matter what
     let silenceStart  = null;
     let speechChunks  = 0;
@@ -255,10 +255,32 @@ document.addEventListener("DOMContentLoaded", function() {
         vadTimer = setInterval(checkVAD, 100);
     }
 
+    // ─── Check-in timer (independent of VAD) ─────────────────────────────────
+    // Fires 10s after the last confirmed speech / AI response / conversation start
+
+    function resetCheckInTimer() {
+        clearTimeout(checkInTimer);
+        if (!isConversationActive) return;
+        checkInTimer = setTimeout(fireCheckIn, CHECK_IN_MS);
+    }
+
+    function fireCheckIn() {
+        if (!isConversationActive || !websocket || websocket.readyState !== WebSocket.OPEN) return;
+        stopVAD();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.onstop = () => {
+                audioChunks = [];
+                websocket.send(JSON.stringify({ action: "check_in" }));
+            };
+            mediaRecorder.stop();
+        } else {
+            websocket.send(JSON.stringify({ action: "check_in" }));
+        }
+    }
+
     function checkVAD() {
         if (!analyser || !isConversationActive) return;
 
-        // Use frequency data (0-255): more robust than time-domain RMS
         const buf = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteFrequencyData(buf);
 
@@ -269,36 +291,17 @@ document.addEventListener("DOMContentLoaded", function() {
         const now = Date.now();
 
         if (avg > SILENCE_THRESHOLD) {
-            // Possible speech — track it (lastSpeechTime updated only on confirmed speech in submitRecording)
             silenceStart = null;
             hasSpeech    = true;
             speechChunks++;
         } else {
-            // Silence — check if we should fire a check-in immediately
-            if (!hasSpeech && lastSpeechTime > 0 && now - lastSpeechTime > CHECK_IN_MS) {
-                // User has been silent for 10s+ — stop recording and ask check-in
-                lastSpeechTime = now;
-                stopVAD();
-                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                    mediaRecorder.onstop = () => {
-                        audioChunks = [];
-                        if (isConversationActive && websocket && websocket.readyState === WebSocket.OPEN) {
-                            websocket.send(JSON.stringify({ action: "check_in" }));
-                        }
-                    };
-                    mediaRecorder.stop();
-                }
-                return;
-            }
-
-            // Normal silence-after-speech detection
             if (hasSpeech) {
                 if (!silenceStart) silenceStart = now;
                 if (now - silenceStart > SILENCE_DURATION_MS) {
                     submitRecording();
                 }
             } else if (now - recordingStart > MAX_RECORD_MS) {
-                // Hard cutoff with no speech — restart quietly
+                // No speech at all in this window — restart listening quietly
                 submitRecording();
             }
         }
@@ -310,8 +313,8 @@ document.addEventListener("DOMContentLoaded", function() {
 
         mediaRecorder.onstop = async () => {
             if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
-                // Speech detected — reset silence timer and send audio
-                lastSpeechTime = Date.now();
+                // Confirmed speech — reset check-in timer and send audio
+                resetCheckInTimer();
                 const blob     = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
                 const arrayBuf = await blob.arrayBuffer();
                 const base64   = arrayBufferToBase64(arrayBuf);
@@ -377,7 +380,7 @@ document.addEventListener("DOMContentLoaded", function() {
             URL.revokeObjectURL(url);
             currentAudio = null;
             hideVoiceAnimation();
-            lastSpeechTime = Date.now(); // reset silence clock after AI finishes speaking
+            resetCheckInTimer(); // restart 10s silence clock after AI finishes speaking
             startNextTurn();
         };
 
@@ -405,13 +408,14 @@ document.addEventListener("DOMContentLoaded", function() {
         if (!ok) return;
 
         isConversationActive = true;
-        lastSpeechTime = Date.now();
         setAgentState('listening');
         connectWebSocket();
+        resetCheckInTimer(); // start 10s silence clock immediately
     });
 
     stopButton.addEventListener('click', function() {
         isConversationActive = false;
+        clearTimeout(checkInTimer);
         stopVAD();
         stopRecording();
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
