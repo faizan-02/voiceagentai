@@ -27,6 +27,9 @@ document.addEventListener("DOMContentLoaded", function() {
     let isSessionActive = false;
     let ephemeralKey = null;
     let audioPlayer = new Audio();
+    let lastSpeechTime = 0;
+    let silenceCheckTimer = null;
+    const CHECK_IN_MS = 12000;
     
     // Set dark mode as default
     setDarkModeDefault();
@@ -456,6 +459,21 @@ document.addEventListener("DOMContentLoaded", function() {
                 // Set mic icon to waiting state
                 updateHeaderMicIcon(false);
                 
+                // Start silence check-in timer
+                lastSpeechTime = Date.now();
+                silenceCheckTimer = setInterval(() => {
+                    if (!isSessionActive || !dataChannel || dataChannel.readyState !== 'open') return;
+                    if (Date.now() - lastSpeechTime > CHECK_IN_MS) {
+                        lastSpeechTime = Date.now();
+                        dataChannel.send(JSON.stringify({
+                            type: "response.create",
+                            response: {
+                                instructions: "The user has been silent for a while. Gently ask them 'Are you still there? Is there anything else I can help you with?'"
+                            }
+                        }));
+                    }
+                }, 2000);
+
                 // Start microphone automatically
                 toggleMicrophone();
                 console.log("Session started successfully");
@@ -634,7 +652,8 @@ document.addEventListener("DOMContentLoaded", function() {
                     animateVoiceBars('aiVoiceVisualization');
                     
                 } else if (messageType === "conversation.item.message.completed") {
-                    // Message completed
+                    // Message completed — reset silence timer so check-in is 12s after AI finishes
+                    lastSpeechTime = Date.now();
                     debugLog("AI message completed", "success");
                     // Hide AI voice visualization
                     aiVoiceVisualization.classList.add('hidden');
@@ -650,7 +669,8 @@ document.addEventListener("DOMContentLoaded", function() {
                     }
                     
                 } else if (messageType === "audio_buffer.meta.received") {
-                    // Audio buffer meta info
+                    // Audio buffer meta info — user is speaking, reset silence timer
+                    lastSpeechTime = Date.now();
                     debugLog("Audio received by API - user is speaking", "info");
                     // Show user voice visualization
                     userVoiceVisualization.classList.remove('hidden');
@@ -951,9 +971,12 @@ document.addEventListener("DOMContentLoaded", function() {
             audioPlayer.srcObject = null;
         }
         
+        // Stop silence check-in timer
+        if (silenceCheckTimer) { clearInterval(silenceCheckTimer); silenceCheckTimer = null; }
+
         // Update state
         isSessionActive = false;
-        
+
         // Update UI
         sessionStatus.textContent = "Inactive";
         sessionStatus.classList.remove("badge-success", "badge-warning", "badge-danger");

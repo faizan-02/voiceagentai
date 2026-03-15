@@ -29,8 +29,8 @@ document.addEventListener("DOMContentLoaded", function() {
     let isConversationActive   = false;
     let currentAudio           = null;
     let audioResponseReceived  = false;
-    let noSpeechCycles         = 0;
-    const NO_SPEECH_CHECKIN    = 2;
+    let lastSpeechTime          = 0;
+    const CHECK_IN_MS           = 12000;
 
     // VAD tuning (same as scripts.js)
     const SILENCE_THRESHOLD    = 8;
@@ -205,13 +205,32 @@ document.addEventListener("DOMContentLoaded", function() {
         const avg = sum / buf.length;
         const now = Date.now();
 
-        if (now - recordingStart > MAX_RECORD_MS) { submitRecording(); return; }
-
         if (avg > SILENCE_THRESHOLD) {
             silenceStart = null; hasSpeech = true; speechChunks++;
-        } else if (hasSpeech) {
-            if (!silenceStart) silenceStart = now;
-            if (now - silenceStart > SILENCE_DURATION_MS) submitRecording();
+            lastSpeechTime = now;
+        } else {
+            // Fire check-in immediately once 10s of silence detected (no speech this round)
+            if (!hasSpeech && lastSpeechTime > 0 && now - lastSpeechTime > CHECK_IN_MS) {
+                lastSpeechTime = now;
+                stopVAD();
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.onstop = () => {
+                        audioChunks = [];
+                        if (isConversationActive && websocket && websocket.readyState === WebSocket.OPEN) {
+                            websocket.send(JSON.stringify({ action: "check_in" }));
+                        }
+                    };
+                    mediaRecorder.stop();
+                }
+                return;
+            }
+
+            if (hasSpeech) {
+                if (!silenceStart) silenceStart = now;
+                if (now - silenceStart > SILENCE_DURATION_MS) submitRecording();
+            } else if (now - recordingStart > MAX_RECORD_MS) {
+                submitRecording();
+            }
         }
     }
 
@@ -221,7 +240,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
         mediaRecorder.onstop = async () => {
             if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
-                noSpeechCycles = 0;
+                lastSpeechTime = Date.now();
                 const blob   = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
                 const ab     = await blob.arrayBuffer();
                 const b64    = arrayBufferToBase64(ab);
@@ -234,14 +253,7 @@ document.addEventListener("DOMContentLoaded", function() {
                 }
             } else {
                 audioChunks = [];
-                noSpeechCycles++;
-                if (noSpeechCycles >= NO_SPEECH_CHECKIN && isConversationActive &&
-                    websocket && websocket.readyState === WebSocket.OPEN) {
-                    noSpeechCycles = 0;
-                    websocket.send(JSON.stringify({ action: "check_in" }));
-                } else if (isConversationActive) {
-                    nextTurn();
-                }
+                if (isConversationActive) nextTurn();
             }
         };
         mediaRecorder.stop();
@@ -281,7 +293,9 @@ document.addEventListener("DOMContentLoaded", function() {
 
         currentAudio.onended = () => {
             URL.revokeObjectURL(url); currentAudio = null;
-            hideVoiceAnim(); nextTurn();
+            hideVoiceAnim();
+            lastSpeechTime = Date.now(); // reset silence clock after AI finishes speaking
+            nextTurn();
         };
         currentAudio.onerror = () => {
             URL.revokeObjectURL(url); currentAudio = null;
@@ -297,7 +311,7 @@ document.addEventListener("DOMContentLoaded", function() {
         const ok = await initMic();
         if (!ok) return;
         isConversationActive = true;
-        noSpeechCycles = 0;
+        lastSpeechTime = Date.now();
         setStatus('listening');
         connectWebSocket();
     });
