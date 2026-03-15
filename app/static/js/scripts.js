@@ -40,12 +40,14 @@ document.addEventListener("DOMContentLoaded", function() {
     let audioResponseReceived = false;
 
     // VAD tuning
-    const SILENCE_THRESHOLD  = 12;    // RMS (0-100 scale) below this = silence
-    const SILENCE_DURATION_MS = 1600; // ms of continuous silence before submitting
-    const MIN_SPEECH_CHUNKS  = 4;     // minimum 100 ms chunks with speech
+    const SILENCE_THRESHOLD   = 8;    // avg frequency amplitude (0-255 scale) — low = sensitive
+    const SILENCE_DURATION_MS = 1800; // ms of continuous silence before submitting
+    const MIN_SPEECH_CHUNKS   = 2;    // minimum 100ms chunks with detected speech
+    const MAX_RECORD_MS       = 12000; // hard cut-off — submit after 12 s no matter what
     let silenceStart  = null;
     let speechChunks  = 0;
     let hasSpeech     = false;
+    let recordingStart = null;
 
     // Populate dropdowns on load
     fetchCharacters();
@@ -231,10 +233,11 @@ document.addEventListener("DOMContentLoaded", function() {
     function startRecording() {
         if (!mediaStream || !isConversationActive) return;
 
-        audioChunks  = [];
-        hasSpeech    = false;
-        silenceStart = null;
-        speechChunks = 0;
+        audioChunks    = [];
+        hasSpeech      = false;
+        silenceStart   = null;
+        speechChunks   = 0;
+        recordingStart = Date.now();
 
         const mimeType = getSupportedMimeType();
         try {
@@ -246,30 +249,36 @@ document.addEventListener("DOMContentLoaded", function() {
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
         mediaRecorder.start(100);
 
-        // Start VAD polling at 100ms intervals
+        // VAD polling every 100ms
         vadTimer = setInterval(checkVAD, 100);
     }
 
     function checkVAD() {
         if (!analyser || !isConversationActive) return;
 
+        // Use frequency data (0-255): more robust than time-domain RMS
         const buf = new Uint8Array(analyser.frequencyBinCount);
-        analyser.getByteTimeDomainData(buf);
+        analyser.getByteFrequencyData(buf);
 
         let sum = 0;
-        for (let i = 0; i < buf.length; i++) {
-            const v = (buf[i] - 128) / 128;
-            sum += v * v;
-        }
-        const rms = Math.sqrt(sum / buf.length) * 100;
+        for (let i = 0; i < buf.length; i++) sum += buf[i];
+        const avg = sum / buf.length;
 
-        if (rms > SILENCE_THRESHOLD) {
+        const now = Date.now();
+
+        // Hard cutoff — never record more than MAX_RECORD_MS
+        if (now - recordingStart > MAX_RECORD_MS) {
+            submitRecording();
+            return;
+        }
+
+        if (avg > SILENCE_THRESHOLD) {
             silenceStart = null;
             hasSpeech    = true;
             speechChunks++;
         } else if (hasSpeech) {
-            if (!silenceStart) silenceStart = Date.now();
-            if (Date.now() - silenceStart > SILENCE_DURATION_MS) {
+            if (!silenceStart) silenceStart = now;
+            if (now - silenceStart > SILENCE_DURATION_MS) {
                 submitRecording();
             }
         }
