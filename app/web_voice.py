@@ -323,6 +323,9 @@ async def ws_voice_endpoint(websocket: WebSocket):
 
                 # 3. Empty transcript — ask user to speak again
                 if not transcript:
+                    # Whisper returned nothing — echo or too-quiet audio.
+                    # Tell user so they know to speak again (not a silent loop).
+                    await send({"action": "error", "message": "Didn't catch that — please speak again."})
                     await send({"action": "listening"})
                     continue
 
@@ -348,6 +351,9 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 system_msg = f"Today's date is {today_str}.\n\n" + system_msg
 
                 # 5. Generate AI response (sync → executor)
+                # Trim history to last 20 messages to avoid token-limit failures
+                if len(history) > 20:
+                    history = history[-20:]
                 try:
                     loop = asyncio.get_event_loop()
                     ai_response: str = await loop.run_in_executor(
@@ -431,6 +437,8 @@ async def ws_voice_endpoint(websocket: WebSocket):
                     system_msg = f"You are {character.capitalize()}, a helpful AI assistant."
                 today_str = date.today().strftime("%A, %d %B %Y")
                 system_msg = f"Today's date is {today_str}.\n\n" + system_msg
+                if len(history) > 20:
+                    history = history[-20:]
 
                 try:
                     loop = asyncio.get_event_loop()

@@ -28,6 +28,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
     // ─── Runtime state ────────────────────────────────────────────────────────
     let agentState           = 'idle';
+    let thinkingTimeout      = null; // safety: escape "thinking" state if server never responds
     let websocket            = null;
     let mediaStream          = null;
     let mediaRecorder        = null;
@@ -69,6 +70,17 @@ document.addEventListener("DOMContentLoaded", function() {
         if (state === 'thinking' || state === 'speaking') {
             clearTimeout(checkInTimer);
             checkInTimer = null;
+        }
+        // Safety timeout: if stuck thinking for 30s with no server response, restart
+        clearTimeout(thinkingTimeout);
+        if (state === 'thinking') {
+            thinkingTimeout = setTimeout(() => {
+                if (agentState === 'thinking' && isConversationActive) {
+                    console.warn('Thinking timeout — restarting turn');
+                    hideThinkingIndicator();
+                    startNextTurn();
+                }
+            }, 30000);
         }
         updateStatusBar();
         updateButtonStates();
@@ -190,18 +202,12 @@ document.addEventListener("DOMContentLoaded", function() {
             case "error": {
                 const msg = data.message || "An error occurred.";
                 console.error("Server error:", msg);
-                // Silently restart on transcription/audio quality errors — no need to alarm user
-                const isTranscriptionErr = msg.toLowerCase().includes('transcription') ||
-                                           msg.toLowerCase().includes('corrupted') ||
-                                           msg.toLowerCase().includes('unsupported');
-                if (!isTranscriptionErr) {
-                    displayMessage(msg, 'error-message');
-                }
+                displayMessage(`⚠ ${msg}`, 'error-message');
                 hideThinkingIndicator();
                 hideListeningIndicator();
                 hideVoiceAnimation();
                 if (isConversationActive) {
-                    setTimeout(startNextTurn, isTranscriptionErr ? 300 : 1200);
+                    setTimeout(startNextTurn, 1500);
                 }
                 break;
             }
@@ -449,7 +455,18 @@ document.addEventListener("DOMContentLoaded", function() {
             URL.revokeObjectURL(url);
             currentAudio = null;
             hideVoiceAnimation();
-            startNextTurn();
+            // ── Echo dead-zone ──────────────────────────────────────────────
+            // After AI finishes speaking, room reverb can linger 200-500ms.
+            // Suppress VAD for 700ms so we don't submit echo audio to Whisper
+            // (echo produces empty transcripts → "thinking 1-2s → listening" loop).
+            vadReady = false;
+            startNextTurn();          // starts MediaRecorder immediately (captures real audio)
+            setTimeout(() => {
+                if (isConversationActive) {
+                    vadReady = true;
+                    if (agentState === 'listening') resetCheckInTimer();
+                }
+            }, 700);
         };
 
         currentAudio.onerror = (e) => {
@@ -457,13 +474,19 @@ document.addEventListener("DOMContentLoaded", function() {
             URL.revokeObjectURL(url);
             currentAudio = null;
             hideVoiceAnimation();
+            vadReady = false;
             startNextTurn();
+            setTimeout(() => { if (isConversationActive) { vadReady = true; if (agentState === 'listening') resetCheckInTimer(); } }, 700);
         };
 
         currentAudio.play().catch(e => {
             console.error("play() rejected:", e);
+            URL.revokeObjectURL(url);
+            currentAudio = null;
             hideVoiceAnimation();
+            vadReady = false;
             startNextTurn();
+            setTimeout(() => { if (isConversationActive) { vadReady = true; if (agentState === 'listening') resetCheckInTimer(); } }, 700);
         });
     }
 
@@ -479,13 +502,11 @@ document.addEventListener("DOMContentLoaded", function() {
         vadReady = false;
         setAgentState('listening');
         connectWebSocket();
-        // Delay VAD readiness by 2s to cover AudioContext warmup.
-        // Timer starts in startRecording once vadReady=true.
+        // 800ms warmup: AudioContext needs a moment before getByteTimeDomainData is reliable
         setTimeout(() => {
             vadReady = true;
-            // If we're already in listening state, kick off the check-in timer now
             if (isConversationActive && agentState === 'listening') resetCheckInTimer();
-        }, 2000);
+        }, 800);
     });
 
     function endConversation() {
