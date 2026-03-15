@@ -76,6 +76,20 @@ _CONFIRMATION_PHRASES = [
     'looking forward to seeing you', "we'll be in touch", 'all booked',
 ]
 
+_GOODBYE_PHRASES = [
+    'have a wonderful day', 'have a great day', 'have a lovely day',
+    'enjoy your visit', 'enjoy your day', 'take care', 'goodbye', 'good bye',
+    'see you soon', 'see you then', 'talk to you soon', 'have a good one',
+    "don't hesitate to reach out", 'feel free to reach out', 'farewell',
+    'looking forward to seeing you', 'have a nice day',
+]
+
+
+def _is_conversation_over(ai_text: str) -> bool:
+    """Return True if the AI response is a clear farewell / conversation-ender."""
+    t = ai_text.lower()
+    return any(phrase in t for phrase in _GOODBYE_PHRASES)
+
 
 def _extract_booking_info(text: str) -> dict:
     """Extract date and/or service mention from user text. Returns dict with found fields only."""
@@ -373,9 +387,10 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 await send({"action": "response_text", "text": clean_response})
                 await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
                 await send({"action": "done"})
-                # Check if this response contains a booking confirmation
                 if _is_booking_confirmed(clean_response):
                     await send({"action": "booking_confirmed"})
+                if _is_conversation_over(clean_response):
+                    await send({"action": "conversation_ended"})
 
             # ------------------------------------------------------------------
             # "check_in" — browser detected prolonged silence; Sara prompts
@@ -445,9 +460,10 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 await send({"action": "response_text", "text": clean_response})
                 await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
                 await send({"action": "done"})
-                # Check if this response contains a booking confirmation
                 if _is_booking_confirmed(clean_response):
                     await send({"action": "booking_confirmed"})
+                if _is_conversation_over(clean_response):
+                    await send({"action": "conversation_ended"})
 
             else:
                 await send({"action": "error", "message": f"Unknown action: {action}"})

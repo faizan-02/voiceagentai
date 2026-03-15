@@ -216,6 +216,20 @@ document.addEventListener("DOMContentLoaded", function() {
             case "booking_confirmed":
                 showBookingSummary();
                 break;
+
+            case "conversation_ended":
+                // Sara said goodbye — end the session after her audio finishes
+                if (currentAudio) {
+                    currentAudio.onended = () => {
+                        URL.revokeObjectURL(currentAudio ? currentAudio.src : '');
+                        currentAudio = null;
+                        hideVoiceAnimation();
+                        endConversation();
+                    };
+                } else {
+                    setTimeout(endConversation, 500);
+                }
+                break;
         }
     }
 
@@ -474,7 +488,8 @@ document.addEventListener("DOMContentLoaded", function() {
         }, 2000);
     });
 
-    stopButton.addEventListener('click', function() {
+    function endConversation() {
+        if (!isConversationActive && agentState === 'idle') return;
         isConversationActive = false;
         vadReady = false;
         clearTimeout(checkInTimer);
@@ -499,7 +514,9 @@ document.addEventListener("DOMContentLoaded", function() {
         if (doneWrap) doneWrap.style.display = 'none';
         const summarySection = document.getElementById('booking-summary-section');
         if (summarySection) summarySection.style.display = 'none';
-    });
+    }
+
+    stopButton.addEventListener('click', endConversation);
 
     clearButton.addEventListener('click', async function() {
         messages.innerHTML = '';
