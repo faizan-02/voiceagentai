@@ -25,7 +25,6 @@ import os
 import tempfile
 
 import aiohttp
-from openai import AsyncOpenAI
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from .app import (
@@ -54,15 +53,27 @@ def _character_prompt_path(character: str) -> str:
 
 
 async def _tts_to_mp3(text: str, voice: str) -> bytes:
-    """Generate TTS via OpenAI SDK and return raw MP3 bytes (no file I/O, no PyAudio)."""
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-    response = await client.audio.speech.create(
-        model="gpt-4o-mini-tts",
-        voice=voice,
-        input=text,
-        response_format="mp3",
-    )
-    return response.content
+    """Generate TTS via direct OpenAI REST call — bypasses SDK to avoid OPENAI_BASE_URL interference."""
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY is not set.")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "tts-1",
+                "input": text,
+                "voice": voice,
+                "response_format": "mp3",
+            },
+        ) as resp:
+            if resp.status == 200:
+                return await resp.read()
+            error = await resp.text()
+            raise RuntimeError(f"TTS API error {resp.status}: {error}")
 
 
 async def _transcribe_webm(audio_bytes: bytes, filename: str = "audio.webm") -> str:
