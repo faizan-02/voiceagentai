@@ -46,10 +46,11 @@ document.addEventListener("DOMContentLoaded", function() {
     let bookingDetails = { date: null, time: null, service: null, servicePrice: null, serviceDuration: null };
 
     // VAD tuning
-    const SILENCE_THRESHOLD   = 15;   // 15/255 — filters noise while catching normal speech
-    const SILENCE_DURATION_MS = 1800; // ms of continuous silence before submitting
-    const MIN_SPEECH_CHUNKS   = 3;    // minimum 300ms of detected speech before submitting
-    const MAX_RECORD_MS       = 12000; // hard cut-off — submit after 12 s no matter what
+    const SILENCE_THRESHOLD   = 10;   // 10/255 — catches soft speech and phone numbers
+    const SILENCE_DURATION_MS = 2500; // ms of continuous silence before submitting (allows pauses mid-phrase)
+    const MIN_SPEECH_CHUNKS   = 4;    // minimum 400ms of detected speech before submitting
+    const MAX_RECORD_MS       = 25000; // hard cut-off — allow time for names + long phone numbers
+    const MIN_AUDIO_BYTES     = 1500;  // reject blobs smaller than this (near-silence artefacts)
     let silenceStart  = null;
     let speechChunks  = 0;
     let hasSpeech     = false;
@@ -185,16 +186,24 @@ document.addEventListener("DOMContentLoaded", function() {
                 }
                 break;
 
-            case "error":
-                console.error("Server error:", data.message);
-                displayMessage(data.message || "An error occurred.", 'error-message');
+            case "error": {
+                const msg = data.message || "An error occurred.";
+                console.error("Server error:", msg);
+                // Silently restart on transcription/audio quality errors — no need to alarm user
+                const isTranscriptionErr = msg.toLowerCase().includes('transcription') ||
+                                           msg.toLowerCase().includes('corrupted') ||
+                                           msg.toLowerCase().includes('unsupported');
+                if (!isTranscriptionErr) {
+                    displayMessage(msg, 'error-message');
+                }
                 hideThinkingIndicator();
                 hideListeningIndicator();
                 hideVoiceAnimation();
                 if (isConversationActive) {
-                    setTimeout(startNextTurn, 1200);
+                    setTimeout(startNextTurn, isTranscriptionErr ? 300 : 1200);
                 }
                 break;
+            }
 
             case "booking_update":
                 // Server extracted date/service/time from user speech — sync the UI
@@ -338,10 +347,17 @@ document.addEventListener("DOMContentLoaded", function() {
 
         mediaRecorder.onstop = async () => {
             if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
-                const blob     = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                audioChunks = [];
+
+                // Skip near-silence blobs — Whisper rejects them with 400
+                if (blob.size < MIN_AUDIO_BYTES) {
+                    if (isConversationActive) startNextTurn();
+                    return;
+                }
+
                 const arrayBuf = await blob.arrayBuffer();
                 const base64   = arrayBufferToBase64(arrayBuf);
-                audioChunks    = [];
 
                 if (websocket && websocket.readyState === WebSocket.OPEN) {
                     hideListeningIndicator();
