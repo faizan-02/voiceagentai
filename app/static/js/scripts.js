@@ -46,10 +46,10 @@ document.addEventListener("DOMContentLoaded", function() {
     // services is an array: [{ name, price, duration }, ...]
     let bookingDetails = { date: null, time: null, services: [] };
 
-    // VAD tuning
-    const SILENCE_THRESHOLD   = 18;   // peak bin threshold (0-255) — max-bin detection is far more sensitive than avg
+    // VAD tuning  (time-domain RMS, 0–128 scale)
+    const SILENCE_THRESHOLD   = 6;    // RMS units — silence ~0-3, whisper ~4-7, normal speech 8+
     const SILENCE_DURATION_MS = 2500; // ms of continuous silence before submitting
-    const MIN_SPEECH_CHUNKS   = 3;    // minimum 300ms of detected speech before submitting
+    const MIN_SPEECH_CHUNKS   = 3;    // minimum 300 ms of detected speech before submitting
     const MAX_RECORD_MS       = 25000; // hard cut-off
     const MIN_AUDIO_BYTES     = 1500;  // reject near-silence blobs
     let silenceStart  = null;
@@ -321,24 +321,27 @@ document.addEventListener("DOMContentLoaded", function() {
     function checkVAD() {
         if (!analyser || !isConversationActive || !vadReady) return;
 
-        // If the AudioContext was suspended by the browser, wake it up.
-        // While suspended getByteFrequencyData returns all-zeros → VAD is blind.
+        // Resume a browser-suspended AudioContext before reading data
         if (audioContext && audioContext.state !== 'running') {
             audioContext.resume().catch(() => {});
-            return; // skip this tick; will be fine next tick
+            return; // skip this tick — context will be running next poll
         }
 
-        const buf = new Uint8Array(analyser.frequencyBinCount);
-        analyser.getByteFrequencyData(buf);
+        // Time-domain RMS: measures actual amplitude, not FFT bins.
+        // Works reliably across all sample rates and mic sensitivities.
+        const buf = new Uint8Array(analyser.fftSize);
+        analyser.getByteTimeDomainData(buf);
 
-        // Use the PEAK bin value (not the average).
-        // Speech energy concentrates in a few bins — peak is far more sensitive than avg.
-        let peak = 0;
-        for (let i = 0; i < buf.length; i++) { if (buf[i] > peak) peak = buf[i]; }
+        let sumSq = 0;
+        for (let i = 0; i < buf.length; i++) {
+            const diff = buf[i] - 128; // 128 = midpoint (silence)
+            sumSq += diff * diff;
+        }
+        const rms = Math.sqrt(sumSq / buf.length); // 0 = silence, ~8-30 = normal speech
 
         const now = Date.now();
 
-        if (peak > SILENCE_THRESHOLD) {
+        if (rms > SILENCE_THRESHOLD) {
             silenceStart = null;
             hasSpeech    = true;
             speechChunks++;
