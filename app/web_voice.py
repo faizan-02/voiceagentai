@@ -393,6 +393,11 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 await send({"action": "response_text", "text": clean_response})
                 await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
                 await send({"action": "done"})
+                # Also extract from AI response — catches mispronunciations the user made
+                # (e.g. user said "root setup" → Sara replied "Root Touch-up" → we catch it here)
+                ai_booking_info = _extract_booking_info(clean_response)
+                if ai_booking_info:
+                    await send({"action": "booking_update", **ai_booking_info})
                 if _is_booking_confirmed(clean_response):
                     await send({"action": "booking_confirmed"})
                 if _is_conversation_over(clean_response):
@@ -468,6 +473,9 @@ async def ws_voice_endpoint(websocket: WebSocket):
                 await send({"action": "response_text", "text": clean_response})
                 await send({"action": "audio_response", "data": audio_b64, "format": "mp3"})
                 await send({"action": "done"})
+                ai_booking_info = _extract_booking_info(clean_response)
+                if ai_booking_info:
+                    await send({"action": "booking_update", **ai_booking_info})
                 if _is_booking_confirmed(clean_response):
                     await send({"action": "booking_confirmed"})
                 if _is_conversation_over(clean_response):
