@@ -261,6 +261,10 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     // ─── Microphone init ──────────────────────────────────────────────────────
+    // webmHeaderChunks holds the first 2 chunks (WebM/Ogg container headers).
+    // They are prepended to every turn's blob so Whisper can parse the audio
+    // without needing a fresh MediaRecorder start each turn.
+    let webmHeaderChunks = [];
 
     async function initMicrophone() {
         try {
@@ -270,6 +274,64 @@ document.addEventListener("DOMContentLoaded", function() {
             analyser = audioContext.createAnalyser();
             analyser.fftSize = 512;
             source.connect(analyser);
+
+            // ── Single long-lived MediaRecorder ───────────────────────────────────
+            // We keep ONE recorder running for the entire conversation instead of
+            // creating/destroying one per turn.  Per-turn stop/start was the root
+            // cause of speech detection degrading after several exchanges.
+            webmHeaderChunks = [];
+            const mimeType = getSupportedMimeType();
+            try {
+                mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : {});
+            } catch (e) {
+                mediaRecorder = new MediaRecorder(mediaStream);
+            }
+
+            let globalChunkIdx = 0;
+            mediaRecorder.onerror = (e) => console.error('MediaRecorder error:', e);
+
+            mediaRecorder.ondataavailable = (e) => {
+                globalChunkIdx++;
+
+                // First 2 chunks = WebM/Ogg container headers — save once, reuse every turn.
+                if (globalChunkIdx <= 2) {
+                    if (e.data.size > 0) webmHeaderChunks.push(e.data);
+                    return;
+                }
+
+                if (!vadActive || !isConversationActive) return;
+                if (e.data.size > 0) audioChunks.push(e.data);
+                if (!vadReady) return;
+
+                const now  = Date.now();
+                const size = e.data.size;
+
+                // ── Dynamic EMA baseline ──────────────────────────────────────────
+                // Only updated during silence so speech doesn't inflate the baseline.
+                // Adapts to any codec, mic, or bitrate automatically each turn.
+                if (!hasSpeech) {
+                    silenceBaseline = 0.85 * silenceBaseline + 0.15 * size;
+                }
+                const speechThreshold = Math.max(silenceBaseline * SPEECH_RATIO, 150);
+
+                if (size >= speechThreshold) {
+                    silenceStart = null;
+                    hasSpeech    = true;
+                    speechChunks++;
+                } else {
+                    if (hasSpeech) {
+                        if (!silenceStart) silenceStart = now;
+                        if (now - silenceStart > SILENCE_DURATION_MS) {
+                            submitRecording();
+                            return;
+                        }
+                    }
+                }
+                // Hard cut-off: submit after MAX_RECORD_MS even while hasSpeech=true.
+                if (now - recordingStart > MAX_RECORD_MS) submitRecording();
+            };
+
+            mediaRecorder.start(100);
             return true;
         } catch (err) {
             console.error("Mic error:", err);
@@ -294,67 +356,20 @@ document.addEventListener("DOMContentLoaded", function() {
         return '';
     }
 
+    // startRecording() now only resets per-turn state — the MediaRecorder keeps running.
     function startRecording() {
         if (!mediaStream || !isConversationActive) return;
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+            console.error('MediaRecorder stopped unexpectedly');
+            return;
+        }
 
         audioChunks    = [];
         hasSpeech      = false;
         silenceStart   = null;
         speechChunks   = 0;
         recordingStart = Date.now();
-
-        const mimeType = getSupportedMimeType();
-        try {
-            mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : {});
-        } catch (e) {
-            mediaRecorder = new MediaRecorder(mediaStream);
-        }
-
-        let chunkIndex = 0;
-        vadActive = true;
-
-        mediaRecorder.ondataavailable = (e) => {
-            if (e.data.size > 0) audioChunks.push(e.data);
-            if (!vadActive || !vadReady || !isConversationActive) return;
-
-            chunkIndex++;
-            if (chunkIndex <= 2) return; // skip first 200ms — WebM container header is oversized
-
-            const now  = Date.now();
-            const size = e.data.size;
-
-            // ── Dynamic EMA baseline ──────────────────────────────────────────────
-            // During silence (hasSpeech=false), update the rolling average of chunk sizes.
-            // This self-calibrates for any codec (Opus, AAC, WebM) and any mic/bitrate.
-            // Speech threshold = 2.5× the silence baseline, floored at 150 bytes.
-            if (!hasSpeech) {
-                silenceBaseline = 0.85 * silenceBaseline + 0.15 * size;
-            }
-            const speechThreshold = Math.max(silenceBaseline * SPEECH_RATIO, 150);
-
-            // ── Chunk-size VAD ────────────────────────────────────────────────────
-            if (size >= speechThreshold) {
-                silenceStart = null;
-                hasSpeech    = true;
-                speechChunks++;
-            } else {
-                if (hasSpeech) {
-                    if (!silenceStart) silenceStart = now;
-                    if (now - silenceStart > SILENCE_DURATION_MS) {
-                        submitRecording();
-                        return;
-                    }
-                }
-            }
-
-            // Hard cut-off: submit after MAX_RECORD_MS even if still hearing speech.
-            // Prevents getting permanently stuck when background noise fakes hasSpeech=true.
-            if (now - recordingStart > MAX_RECORD_MS) {
-                submitRecording();
-            }
-        };
-
-        mediaRecorder.start(100);
+        vadActive      = true;
 
         if (vadReady) resetCheckInTimer();
     }
@@ -372,50 +387,45 @@ document.addEventListener("DOMContentLoaded", function() {
         // Only fire when truly idle-listening — never interrupt AI speaking/thinking
         if (!isConversationActive || agentState !== 'listening') return;
         if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
-        stopVAD();
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-            mediaRecorder.onstop = () => {
-                audioChunks = [];
-                websocket.send(JSON.stringify({ action: "check_in" }));
-            };
-            mediaRecorder.stop();
-        } else {
-            websocket.send(JSON.stringify({ action: "check_in" }));
-        }
+        stopVAD(); // vadActive = false — stop collecting
+        audioChunks = [];
+        // MediaRecorder keeps running — no stop/restart needed
+        websocket.send(JSON.stringify({ action: "check_in" }));
     }
 
-    function submitRecording() {
-        stopVAD();
-        if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+    async function submitRecording() {
+        stopVAD(); // vadActive = false — freeze the turn immediately
 
-        mediaRecorder.onstop = async () => {
-            if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
-                const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-                audioChunks = [];
+        // Snapshot and clear chunks atomically before any await
+        const capturedChunks = audioChunks.slice();
+        audioChunks = [];
 
-                // Skip near-silence blobs — Whisper rejects them with 400
-                if (blob.size < MIN_AUDIO_BYTES) {
-                    if (isConversationActive) startNextTurn();
-                    return;
-                }
+        if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && capturedChunks.length > 0) {
+            // Prepend container headers so Whisper can parse a mid-stream slice
+            const blob = new Blob(
+                [...webmHeaderChunks, ...capturedChunks],
+                { type: mediaRecorder.mimeType || 'audio/webm' }
+            );
 
-                const arrayBuf = await blob.arrayBuffer();
-                const base64   = arrayBufferToBase64(arrayBuf);
-
-                if (websocket && websocket.readyState === WebSocket.OPEN) {
-                    hideListeningIndicator();
-                    setAgentState('thinking');
-                    showThinkingIndicator();
-                    websocket.send(JSON.stringify({ action: "audio", data: base64 }));
-                }
-            } else {
-                // No speech this round — just restart listening
-                audioChunks = [];
+            if (blob.size < MIN_AUDIO_BYTES) {
                 if (isConversationActive) startNextTurn();
+                return;
             }
-        };
 
-        mediaRecorder.stop();
+            const arrayBuf = await blob.arrayBuffer();
+            const base64   = arrayBufferToBase64(arrayBuf);
+
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                hideListeningIndicator();
+                setAgentState('thinking');
+                showThinkingIndicator();
+                websocket.send(JSON.stringify({ action: "audio", data: base64 }));
+            }
+        } else {
+            // No speech detected — restart listening immediately
+            if (isConversationActive) startNextTurn();
+        }
+        // MediaRecorder keeps running — no stop/restart needed
     }
 
     function stopRecording() {
