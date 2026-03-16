@@ -136,8 +136,16 @@ document.addEventListener("DOMContentLoaded", function() {
             }));
         };
 
+        const thisWs = websocket; // capture reference at creation time
         websocket.onclose = function() {
             console.log("ws_voice: closed");
+            // Guard: if a new session has already started a new WebSocket, this is a
+            // stale close from the previous session.  Do NOT touch mediaStream or it will
+            // destroy the new session's microphone (race condition on End→Start).
+            if (websocket !== thisWs) {
+                console.log("ws_voice: stale close ignored");
+                return;
+            }
             stopVAD();
             if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
             if (isConversationActive) { isConversationActive = false; setAgentState('idle'); }
@@ -291,6 +299,8 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function startRecording() {
+        console.log('startRecording() mediaStream=', !!mediaStream, 'isConversationActive=', isConversationActive,
+            'tracks:', mediaStream ? mediaStream.getAudioTracks().map(t => t.readyState) : 'NONE');
         if (!mediaStream || !isConversationActive) return;
 
         audioChunks    = [];
@@ -298,8 +308,6 @@ document.addEventListener("DOMContentLoaded", function() {
         silenceStart   = null;
         speechChunks   = 0;
         recordingStart = Date.now();
-
-        console.log('startRecording() called, mediaStream=', !!mediaStream, 'tracks:', mediaStream ? mediaStream.getAudioTracks().map(t => t.readyState) : []);
         const mimeType = getSupportedMimeType();
         console.log('mimeType=', mimeType);
         try {
