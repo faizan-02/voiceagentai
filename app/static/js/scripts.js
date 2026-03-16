@@ -48,7 +48,7 @@ document.addEventListener("DOMContentLoaded", function() {
     let bookingDetails = { date: null, time: null, services: [] };
 
     // VAD tuning — chunk-size based (opus encodes silence tiny, speech large)
-    const SPEECH_CHUNK_BYTES  = 200;  // bytes/100ms: at Chrome's default 32kbps Opus, silence~50-120, speech~200-400
+    const SPEECH_CHUNK_BYTES  = 50;  // DEBUG: very low threshold — any audio triggers speech detection
     const SILENCE_DURATION_MS = 2000; // ms of sub-threshold chunks before submitting
     const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech-sized chunks before we consider it real
     const MAX_RECORD_MS       = 8000; // hard cut-off — submit after 8s regardless
@@ -299,28 +299,31 @@ document.addEventListener("DOMContentLoaded", function() {
         speechChunks   = 0;
         recordingStart = Date.now();
 
+        console.log('startRecording() called, mediaStream=', !!mediaStream, 'tracks:', mediaStream ? mediaStream.getAudioTracks().map(t => t.readyState) : []);
         const mimeType = getSupportedMimeType();
+        console.log('mimeType=', mimeType);
         try {
-            // audioBitsPerSecond: 64000 → larger chunks, better silence/speech separation
-            mediaRecorder = new MediaRecorder(mediaStream, mimeType
-                ? { mimeType, audioBitsPerSecond: 64000 }
-                : { audioBitsPerSecond: 64000 });
+            mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : {});
         } catch (e) {
+            console.error('MediaRecorder create error:', e);
             mediaRecorder = new MediaRecorder(mediaStream);
         }
+        console.log('MediaRecorder state=', mediaRecorder.state, 'mimeType=', mediaRecorder.mimeType);
 
         let chunkIndex = 0;
         vadActive = true;
 
         mediaRecorder.ondataavailable = (e) => {
+            // DEBUG: log EVERY chunk before any guard so we see if recorder works at all
+            if (audioChunks.length < 30) console.log(`RAW chunk size=${e.data.size} vadActive=${vadActive} vadReady=${vadReady} active=${isConversationActive} ci=${chunkIndex}`);
+
             if (e.data.size > 0) audioChunks.push(e.data);
             if (!vadActive || !vadReady || !isConversationActive) return;
 
             chunkIndex++;
             if (chunkIndex <= 2) return; // skip first 200ms — WebM container header is oversized
 
-            // DEBUG: log first 30 chunk sizes so threshold can be calibrated
-            if (chunkIndex <= 30) console.log(`VAD chunk[${chunkIndex}] ${e.data.size}B (threshold=${SPEECH_CHUNK_BYTES}, hasSpeech=${hasSpeech})`);
+            console.log(`VAD chunk[${chunkIndex}] ${e.data.size}B (threshold=${SPEECH_CHUNK_BYTES}, hasSpeech=${hasSpeech})`);
 
             const now = Date.now();
 
@@ -490,6 +493,7 @@ document.addEventListener("DOMContentLoaded", function() {
         connectWebSocket();
         // 800ms warmup: AudioContext needs a moment before getByteTimeDomainData is reliable
         setTimeout(() => {
+            console.log('vadReady → true (800ms warmup), agentState=', agentState);
             vadReady = true;
             if (isConversationActive && agentState === 'listening') resetCheckInTimer();
         }, 800);
