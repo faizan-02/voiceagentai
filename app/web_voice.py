@@ -52,6 +52,20 @@ _MONTHS_MAP = {
     'november': 'November', 'december': 'December',
 }
 
+# Spoken ordinal words → numeric day (covers 1–31)
+_ORDINAL_WORDS = {
+    'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+    'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10,
+    'eleventh': 11, 'twelfth': 12, 'thirteenth': 13, 'fourteenth': 14,
+    'fifteenth': 15, 'sixteenth': 16, 'seventeenth': 17, 'eighteenth': 18,
+    'nineteenth': 19, 'twentieth': 20, 'twenty first': 21, 'twenty-first': 21,
+    'twenty second': 22, 'twenty-second': 22, 'twenty third': 23, 'twenty-third': 23,
+    'twenty fourth': 24, 'twenty-fourth': 24, 'twenty fifth': 25, 'twenty-fifth': 25,
+    'twenty sixth': 26, 'twenty-sixth': 26, 'twenty seventh': 27, 'twenty-seventh': 27,
+    'twenty eighth': 28, 'twenty-eighth': 28, 'twenty ninth': 29, 'twenty-ninth': 29,
+    'thirtieth': 30, 'thirty first': 31, 'thirty-first': 31,
+}
+
 # Service keywords → (canonical name, price, duration)  Order matters — more specific first
 _SERVICES_MAP = [
     (['gel manicure'],                      'Gel Manicure',           '4,200 PKR',        None),
@@ -94,26 +108,53 @@ def _is_conversation_over(ai_text: str) -> bool:
 def _extract_booking_info(text: str) -> dict:
     """Extract date and/or service mention from user text. Returns dict with found fields only."""
     import re
+    from datetime import date as _date, timedelta as _td
     text_l = text.lower()
     result = {}
 
     # --- Date extraction ---
     day_re = r'(\d{1,2})(?:st|nd|rd|th)?'
-    for month_key, month_display in _MONTHS_MAP.items():
-        # "20th March" / "20 of March"
-        m = re.search(day_re + r'\s+(?:of\s+)?' + month_key, text_l)
-        if m:
-            day = int(m.group(1))
-            if 1 <= day <= 31:
-                result['date'] = f"{day} {month_display}"
+
+    # 1) Relative: "today" / "tomorrow"
+    if not result.get('date'):
+        today = _date.today()
+        if re.search(r'\btomorrow\b', text_l):
+            d = today + _td(days=1)
+            result['date'] = f"{d.day} {d.strftime('%B')}"
+        elif re.search(r'\btoday\b', text_l):
+            result['date'] = f"{today.day} {today.strftime('%B')}"
+
+    # 2) Ordinal word + month: "twentieth of March", "twenty-first March"
+    if not result.get('date'):
+        for ord_word, ord_day in _ORDINAL_WORDS.items():
+            for month_key, month_display in _MONTHS_MAP.items():
+                pattern = ord_word + r'\s+(?:of\s+)?' + month_key
+                if re.search(pattern, text_l):
+                    result['date'] = f"{ord_day} {month_display}"
+                    break
+                # "March twentieth"
+                pattern2 = month_key + r'\s+' + ord_word
+                if re.search(pattern2, text_l):
+                    result['date'] = f"{ord_day} {month_display}"
+                    break
+            if result.get('date'):
                 break
-        # "March 20th"
-        m = re.search(month_key + r'\s+' + day_re, text_l)
-        if m:
-            day = int(m.group(1))
-            if 1 <= day <= 31:
-                result['date'] = f"{day} {month_display}"
-                break
+
+    # 3) Numeric day + month: "20th March" / "March 20th"
+    if not result.get('date'):
+        for month_key, month_display in _MONTHS_MAP.items():
+            m = re.search(day_re + r'\s+(?:of\s+)?' + month_key, text_l)
+            if m:
+                day = int(m.group(1))
+                if 1 <= day <= 31:
+                    result['date'] = f"{day} {month_display}"
+                    break
+            m = re.search(month_key + r'\s+' + day_re, text_l)
+            if m:
+                day = int(m.group(1))
+                if 1 <= day <= 31:
+                    result['date'] = f"{day} {month_display}"
+                    break
 
     # --- Time extraction ---
     # Match "3 PM", "3:30 PM", "3:30pm", "3pm", "15:00", "15:30"
