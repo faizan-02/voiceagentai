@@ -48,7 +48,7 @@ document.addEventListener("DOMContentLoaded", function() {
     let bookingDetails = { date: null, time: null, services: [] };
 
     // VAD tuning — chunk-size based (opus encodes silence tiny, speech large)
-    const SPEECH_CHUNK_BYTES  = 400;  // bytes/100ms: silence~50-250, speech~400+
+    const SPEECH_CHUNK_BYTES  = 200;  // bytes/100ms: at Chrome's default 32kbps Opus, silence~50-120, speech~200-400
     const SILENCE_DURATION_MS = 2000; // ms of sub-threshold chunks before submitting
     const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech-sized chunks before we consider it real
     const MAX_RECORD_MS       = 8000; // hard cut-off — submit after 8s regardless
@@ -301,7 +301,10 @@ document.addEventListener("DOMContentLoaded", function() {
 
         const mimeType = getSupportedMimeType();
         try {
-            mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : {});
+            // audioBitsPerSecond: 64000 → larger chunks, better silence/speech separation
+            mediaRecorder = new MediaRecorder(mediaStream, mimeType
+                ? { mimeType, audioBitsPerSecond: 64000 }
+                : { audioBitsPerSecond: 64000 });
         } catch (e) {
             mediaRecorder = new MediaRecorder(mediaStream);
         }
@@ -316,11 +319,11 @@ document.addEventListener("DOMContentLoaded", function() {
             chunkIndex++;
             if (chunkIndex <= 2) return; // skip first 200ms — WebM container header is oversized
 
+            // DEBUG: log first 30 chunk sizes so threshold can be calibrated
+            if (chunkIndex <= 30) console.log(`VAD chunk[${chunkIndex}] ${e.data.size}B (threshold=${SPEECH_CHUNK_BYTES}, hasSpeech=${hasSpeech})`);
+
             const now = Date.now();
 
-            // Opus chunk-size VAD:
-            // Silence compresses to ~50-250 bytes/100ms; speech compresses to 400+ bytes.
-            // This works regardless of AudioContext state, mic gain, or browser version.
             if (e.data.size >= SPEECH_CHUNK_BYTES) {
                 silenceStart = null;
                 hasSpeech    = true;
