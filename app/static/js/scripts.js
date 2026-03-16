@@ -47,22 +47,17 @@ document.addEventListener("DOMContentLoaded", function() {
     // Booking state
     let bookingDetails = { date: null, time: null, services: [] };
 
-    // ─── VAD constants ────────────────────────────────────────────────────────
-    const SILENCE_DURATION_MS = 1800; // ms of quiet after speech before submitting
-    const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech intervals required before submit
-    const MAX_RECORD_MS       = 12000; // hard cut-off — submit after 12s regardless
-    const MIN_AUDIO_BYTES     = 500;  // reject blobs that are clearly empty
+    // VAD tuning — chunk-size based (opus encodes silence tiny, speech large)
+    const SPEECH_CHUNK_BYTES  = 400;  // bytes/100ms: silence~50-250, speech~400+
+    const SILENCE_DURATION_MS = 2000; // ms of sub-threshold chunks before submitting
+    const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech-sized chunks before we consider it real
+    const MAX_RECORD_MS       = 8000; // hard cut-off — submit after 8s regardless
+    const MIN_AUDIO_BYTES     = 1000; // reject blobs that are clearly empty
     const ECHO_DEAD_ZONE_MS   = 1500; // ms post-AI-speech before VAD activates
-    // RMS thresholds (float32 amplitude 0..1).
-    // Speech is typically 0.02-0.3. Silence / background noise is 0.001-0.01.
-    // Using a very conservative low threshold + hysteresis to avoid false silence.
-    const RMS_SPEECH_ON   = 0.012; // RMS above this → speech
-    const RMS_SPEECH_OFF  = 0.006; // RMS below this → silence (hysteresis)
-    let silenceStart   = null;
-    let speechChunks   = 0;
-    let hasSpeech      = false;
+    let silenceStart  = null;
+    let speechChunks  = 0;
+    let hasSpeech     = false;
     let recordingStart = null;
-    let rmsInterval    = null; // setInterval handle for RMS VAD polling
 
     // Populate dropdowns on load
     fetchCharacters();
@@ -262,10 +257,6 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     // ─── Microphone init ──────────────────────────────────────────────────────
-    // webmHeaderChunks holds the first 2 chunks (WebM/Ogg container headers).
-    // They are prepended to every turn's blob so Whisper can parse the audio
-    // without needing a fresh MediaRecorder start each turn.
-    let webmHeaderChunks = [];
 
     async function initMicrophone() {
         try {
@@ -275,36 +266,6 @@ document.addEventListener("DOMContentLoaded", function() {
             analyser = audioContext.createAnalyser();
             analyser.fftSize = 512;
             source.connect(analyser);
-
-            // ── Single long-lived MediaRecorder ───────────────────────────────────
-            // We keep ONE recorder running for the entire conversation instead of
-            // creating/destroying one per turn.  Per-turn stop/start was the root
-            // cause of speech detection degrading after several exchanges.
-            webmHeaderChunks = [];
-            const mimeType = getSupportedMimeType();
-            try {
-                mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : {});
-            } catch (e) {
-                mediaRecorder = new MediaRecorder(mediaStream);
-            }
-
-            let globalChunkIdx = 0;
-            mediaRecorder.onerror = (e) => console.error('MediaRecorder error:', e);
-
-            mediaRecorder.ondataavailable = (e) => {
-                globalChunkIdx++;
-                // First 2 chunks = WebM/Ogg container headers — save once, reuse every turn.
-                if (globalChunkIdx <= 2) {
-                    if (e.data.size > 0) webmHeaderChunks.push(e.data);
-                    return;
-                }
-                // Just collect audio data — VAD is handled by the RMS interval below.
-                if (vadActive && isConversationActive && e.data.size > 0) {
-                    audioChunks.push(e.data);
-                }
-            };
-
-            mediaRecorder.start(100);
             return true;
         } catch (err) {
             console.error("Mic error:", err);
@@ -329,67 +290,53 @@ document.addEventListener("DOMContentLoaded", function() {
         return '';
     }
 
-    // ─── RMS VAD ─────────────────────────────────────────────────────────────
-    // Uses Web Audio API amplitude instead of codec chunk sizes.
-    // Completely independent of MediaRecorder state — works on any codec/bitrate.
-
-    function startRMSVAD() {
-        stopRMSVAD();
-        rmsInterval = setInterval(() => {
-            if (!vadActive || !vadReady || !isConversationActive) return;
-            if (!analyser) return;
-
-            // Ensure AudioContext is running — it can be suspended by the browser
-            if (audioContext && audioContext.state !== 'running') {
-                audioContext.resume();
-                return;
-            }
-
-            const buf = new Float32Array(analyser.fftSize);
-            analyser.getFloatTimeDomainData(buf);
-            // RMS: root-mean-square of waveform samples gives signal amplitude (0..1)
-            let sum = 0;
-            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-            const rms = Math.sqrt(sum / buf.length);
-
-            const now = Date.now();
-
-            if (rms >= RMS_SPEECH_ON) {
-                silenceStart = null;
-                hasSpeech    = true;
-                speechChunks++;
-            } else if (rms < RMS_SPEECH_OFF) {
-                if (hasSpeech) {
-                    if (!silenceStart) silenceStart = now;
-                    if (now - silenceStart > SILENCE_DURATION_MS) { submitRecording(); return; }
-                }
-            }
-            // Hard cut-off regardless of speech state
-            if (now - recordingStart > MAX_RECORD_MS) submitRecording();
-        }, 100);
-    }
-
-    function stopRMSVAD() {
-        if (rmsInterval) { clearInterval(rmsInterval); rmsInterval = null; }
-    }
-
-    // startRecording() resets per-turn state and starts the RMS polling.
-    // The MediaRecorder keeps running — only state is reset.
     function startRecording() {
         if (!mediaStream || !isConversationActive) return;
-        if (!mediaRecorder || mediaRecorder.state === 'inactive') {
-            console.error('MediaRecorder stopped unexpectedly');
-            return;
-        }
 
         audioChunks    = [];
         hasSpeech      = false;
         silenceStart   = null;
         speechChunks   = 0;
         recordingStart = Date.now();
-        vadActive      = true;
 
-        startRMSVAD();
+        const mimeType = getSupportedMimeType();
+        try {
+            mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : {});
+        } catch (e) {
+            mediaRecorder = new MediaRecorder(mediaStream);
+        }
+
+        let chunkIndex = 0;
+        vadActive = true;
+
+        mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) audioChunks.push(e.data);
+            if (!vadActive || !vadReady || !isConversationActive) return;
+
+            chunkIndex++;
+            if (chunkIndex <= 2) return; // skip first 200ms — WebM container header is oversized
+
+            const now = Date.now();
+
+            // Opus chunk-size VAD:
+            // Silence compresses to ~50-250 bytes/100ms; speech compresses to 400+ bytes.
+            // This works regardless of AudioContext state, mic gain, or browser version.
+            if (e.data.size >= SPEECH_CHUNK_BYTES) {
+                silenceStart = null;
+                hasSpeech    = true;
+                speechChunks++;
+            } else {
+                if (hasSpeech) {
+                    if (!silenceStart) silenceStart = now;
+                    if (now - silenceStart > SILENCE_DURATION_MS) submitRecording();
+                } else if (now - recordingStart > MAX_RECORD_MS) {
+                    submitRecording();
+                }
+            }
+        };
+
+        mediaRecorder.start(100);
+
         if (vadReady) resetCheckInTimer();
     }
 
@@ -406,45 +353,50 @@ document.addEventListener("DOMContentLoaded", function() {
         // Only fire when truly idle-listening — never interrupt AI speaking/thinking
         if (!isConversationActive || agentState !== 'listening') return;
         if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
-        stopVAD(); // vadActive = false — stop collecting
-        audioChunks = [];
-        // MediaRecorder keeps running — no stop/restart needed
-        websocket.send(JSON.stringify({ action: "check_in" }));
+        stopVAD();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.onstop = () => {
+                audioChunks = [];
+                websocket.send(JSON.stringify({ action: "check_in" }));
+            };
+            mediaRecorder.stop();
+        } else {
+            websocket.send(JSON.stringify({ action: "check_in" }));
+        }
     }
 
-    async function submitRecording() {
-        stopVAD(); // vadActive = false — freeze the turn immediately
+    function submitRecording() {
+        stopVAD();
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
 
-        // Snapshot and clear chunks atomically before any await
-        const capturedChunks = audioChunks.slice();
-        audioChunks = [];
+        mediaRecorder.onstop = async () => {
+            if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && audioChunks.length > 0) {
+                const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                audioChunks = [];
 
-        if (hasSpeech && speechChunks >= MIN_SPEECH_CHUNKS && capturedChunks.length > 0) {
-            // Prepend container headers so Whisper can parse a mid-stream slice
-            const blob = new Blob(
-                [...webmHeaderChunks, ...capturedChunks],
-                { type: mediaRecorder.mimeType || 'audio/webm' }
-            );
+                // Skip near-silence blobs — Whisper rejects them with 400
+                if (blob.size < MIN_AUDIO_BYTES) {
+                    if (isConversationActive) startNextTurn();
+                    return;
+                }
 
-            if (blob.size < MIN_AUDIO_BYTES) {
+                const arrayBuf = await blob.arrayBuffer();
+                const base64   = arrayBufferToBase64(arrayBuf);
+
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    hideListeningIndicator();
+                    setAgentState('thinking');
+                    showThinkingIndicator();
+                    websocket.send(JSON.stringify({ action: "audio", data: base64 }));
+                }
+            } else {
+                // No speech this round — just restart listening
+                audioChunks = [];
                 if (isConversationActive) startNextTurn();
-                return;
             }
+        };
 
-            const arrayBuf = await blob.arrayBuffer();
-            const base64   = arrayBufferToBase64(arrayBuf);
-
-            if (websocket && websocket.readyState === WebSocket.OPEN) {
-                hideListeningIndicator();
-                setAgentState('thinking');
-                showThinkingIndicator();
-                websocket.send(JSON.stringify({ action: "audio", data: base64 }));
-            }
-        } else {
-            // No speech detected — restart listening immediately
-            if (isConversationActive) startNextTurn();
-        }
-        // MediaRecorder keeps running — no stop/restart needed
+        mediaRecorder.stop();
     }
 
     function stopRecording() {
@@ -459,7 +411,6 @@ document.addEventListener("DOMContentLoaded", function() {
 
     function stopVAD() {
         vadActive = false;
-        stopRMSVAD();
         if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
     }
 
