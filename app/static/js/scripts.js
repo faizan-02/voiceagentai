@@ -35,8 +35,8 @@ document.addEventListener("DOMContentLoaded", function() {
     let audioChunks          = [];
     let audioContext         = null;
     let analyser             = null;
-    let vadTimer             = null;  // kept for compat with stopVAD()
-    let vadActive            = false; // chunk-based VAD gate
+    let vadTimer             = null;  // RMS polling interval
+    let vadActive            = false; // VAD gate
     let isConversationActive = false;
     let currentAudio         = null;
     let audioResponseReceived = false;
@@ -47,10 +47,10 @@ document.addEventListener("DOMContentLoaded", function() {
     // Booking state
     let bookingDetails = { date: null, time: null, services: [] };
 
-    // VAD tuning — chunk-size based (opus encodes silence tiny, speech large)
-    const SPEECH_CHUNK_BYTES  = 50;  // DEBUG: very low threshold — any audio triggers speech detection
-    const SILENCE_DURATION_MS = 2000; // ms of sub-threshold chunks before submitting
-    const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech-sized chunks before we consider it real
+    // VAD tuning — RMS amplitude based
+    const RMS_SPEECH_THRESHOLD = 0.015; // amplitude threshold (0.0–1.0) to consider as speech
+    const SILENCE_DURATION_MS  = 1500;  // ms of silence after speech before submitting
+    const MIN_SPEECH_CHUNKS    = 5;     // ~250ms of speech intervals before we consider it real
     const MAX_RECORD_MS       = 8000; // hard cut-off — submit after 8s regardless
     const MIN_AUDIO_BYTES     = 1000; // reject blobs that are clearly empty
     const ECHO_DEAD_ZONE_MS   = 1500; // ms post-AI-speech before VAD activates
@@ -299,8 +299,6 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function startRecording() {
-        console.log('startRecording() mediaStream=', !!mediaStream, 'isConversationActive=', isConversationActive,
-            'tracks:', mediaStream ? mediaStream.getAudioTracks().map(t => t.readyState) : 'NONE');
         if (!mediaStream || !isConversationActive) return;
 
         audioChunks    = [];
@@ -309,33 +307,36 @@ document.addEventListener("DOMContentLoaded", function() {
         speechChunks   = 0;
         recordingStart = Date.now();
         const mimeType = getSupportedMimeType();
-        console.log('mimeType=', mimeType);
         try {
             mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : {});
         } catch (e) {
-            console.error('MediaRecorder create error:', e);
             mediaRecorder = new MediaRecorder(mediaStream);
         }
-        console.log('MediaRecorder state=', mediaRecorder.state, 'mimeType=', mediaRecorder.mimeType);
 
-        let chunkIndex = 0;
         vadActive = true;
 
+        // Collect all audio chunks — VAD is done via RMS, not chunk size
         mediaRecorder.ondataavailable = (e) => {
-            // DEBUG: log EVERY chunk before any guard so we see if recorder works at all
-            if (audioChunks.length < 30) console.log(`RAW chunk size=${e.data.size} vadActive=${vadActive} vadReady=${vadReady} active=${isConversationActive} ci=${chunkIndex}`);
-
             if (e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.start(100);
+
+        // RMS amplitude VAD — runs every 50ms, independent of encoder bitrate mode
+        const buf = new Float32Array(analyser.fftSize);
+        vadTimer = setInterval(() => {
             if (!vadActive || !vadReady || !isConversationActive) return;
 
-            chunkIndex++;
-            if (chunkIndex <= 2) return; // skip first 200ms — WebM container header is oversized
+            // Ensure AudioContext is running (browser may suspend it)
+            if (audioContext && audioContext.state === 'suspended') audioContext.resume();
 
-            console.log(`VAD chunk[${chunkIndex}] ${e.data.size}B (threshold=${SPEECH_CHUNK_BYTES}, hasSpeech=${hasSpeech})`);
+            analyser.getFloatTimeDomainData(buf);
+            let sum = 0;
+            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+            const rms = Math.sqrt(sum / buf.length);
 
             const now = Date.now();
-
-            if (e.data.size >= SPEECH_CHUNK_BYTES) {
+            if (rms >= RMS_SPEECH_THRESHOLD) {
                 silenceStart = null;
                 hasSpeech    = true;
                 speechChunks++;
@@ -347,9 +348,7 @@ document.addEventListener("DOMContentLoaded", function() {
                     submitRecording();
                 }
             }
-        };
-
-        mediaRecorder.start(100);
+        }, 50);
 
         if (vadReady) resetCheckInTimer();
     }
