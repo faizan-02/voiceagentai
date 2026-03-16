@@ -47,21 +47,22 @@ document.addEventListener("DOMContentLoaded", function() {
     // Booking state
     let bookingDetails = { date: null, time: null, services: [] };
 
-    // VAD tuning — chunk-size based (opus encodes silence tiny, speech large)
-    const SILENCE_DURATION_MS = 2000; // ms of sub-threshold chunks before submitting
-    const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech-sized chunks required
-    const MAX_RECORD_MS       = 12000; // hard cut-off — submit after 12s regardless (even if hasSpeech)
-    const MIN_AUDIO_BYTES     = 1000; // reject blobs that are clearly empty
+    // ─── VAD constants ────────────────────────────────────────────────────────
+    const SILENCE_DURATION_MS = 1800; // ms of quiet after speech before submitting
+    const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech intervals required before submit
+    const MAX_RECORD_MS       = 12000; // hard cut-off — submit after 12s regardless
+    const MIN_AUDIO_BYTES     = 500;  // reject blobs that are clearly empty
     const ECHO_DEAD_ZONE_MS   = 1500; // ms post-AI-speech before VAD activates
-    const SPEECH_RATIO        = 2.5;  // chunk must be > 2.5× silence baseline to count as speech
-    let silenceStart    = null;
-    let speechChunks    = 0;
-    let hasSpeech       = false;
-    let recordingStart  = null;
-    // Dynamic silence baseline (exponential moving average).
-    // Only updated during silence (hasSpeech=false) so speech doesn't inflate it.
-    // Adapts per-device, per-codec, per-turn — no fixed threshold needed.
-    let silenceBaseline = 100; // starting estimate in bytes; converges within ~10 chunks
+    // RMS thresholds (float32 amplitude 0..1).
+    // Speech is typically 0.02-0.3. Silence / background noise is 0.001-0.01.
+    // Using a very conservative low threshold + hysteresis to avoid false silence.
+    const RMS_SPEECH_ON   = 0.012; // RMS above this → speech
+    const RMS_SPEECH_OFF  = 0.006; // RMS below this → silence (hysteresis)
+    let silenceStart   = null;
+    let speechChunks   = 0;
+    let hasSpeech      = false;
+    let recordingStart = null;
+    let rmsInterval    = null; // setInterval handle for RMS VAD polling
 
     // Populate dropdowns on load
     fetchCharacters();
@@ -292,43 +293,15 @@ document.addEventListener("DOMContentLoaded", function() {
 
             mediaRecorder.ondataavailable = (e) => {
                 globalChunkIdx++;
-
                 // First 2 chunks = WebM/Ogg container headers — save once, reuse every turn.
                 if (globalChunkIdx <= 2) {
                     if (e.data.size > 0) webmHeaderChunks.push(e.data);
                     return;
                 }
-
-                if (!vadActive || !isConversationActive) return;
-                if (e.data.size > 0) audioChunks.push(e.data);
-                if (!vadReady) return;
-
-                const now  = Date.now();
-                const size = e.data.size;
-
-                // ── Dynamic EMA baseline ──────────────────────────────────────────
-                // Only updated during silence so speech doesn't inflate the baseline.
-                // Adapts to any codec, mic, or bitrate automatically each turn.
-                if (!hasSpeech) {
-                    silenceBaseline = 0.85 * silenceBaseline + 0.15 * size;
+                // Just collect audio data — VAD is handled by the RMS interval below.
+                if (vadActive && isConversationActive && e.data.size > 0) {
+                    audioChunks.push(e.data);
                 }
-                const speechThreshold = Math.max(silenceBaseline * SPEECH_RATIO, 150);
-
-                if (size >= speechThreshold) {
-                    silenceStart = null;
-                    hasSpeech    = true;
-                    speechChunks++;
-                } else {
-                    if (hasSpeech) {
-                        if (!silenceStart) silenceStart = now;
-                        if (now - silenceStart > SILENCE_DURATION_MS) {
-                            submitRecording();
-                            return;
-                        }
-                    }
-                }
-                // Hard cut-off: submit after MAX_RECORD_MS even while hasSpeech=true.
-                if (now - recordingStart > MAX_RECORD_MS) submitRecording();
             };
 
             mediaRecorder.start(100);
@@ -356,7 +329,52 @@ document.addEventListener("DOMContentLoaded", function() {
         return '';
     }
 
-    // startRecording() now only resets per-turn state — the MediaRecorder keeps running.
+    // ─── RMS VAD ─────────────────────────────────────────────────────────────
+    // Uses Web Audio API amplitude instead of codec chunk sizes.
+    // Completely independent of MediaRecorder state — works on any codec/bitrate.
+
+    function startRMSVAD() {
+        stopRMSVAD();
+        rmsInterval = setInterval(() => {
+            if (!vadActive || !vadReady || !isConversationActive) return;
+            if (!analyser) return;
+
+            // Ensure AudioContext is running — it can be suspended by the browser
+            if (audioContext && audioContext.state !== 'running') {
+                audioContext.resume();
+                return;
+            }
+
+            const buf = new Float32Array(analyser.fftSize);
+            analyser.getFloatTimeDomainData(buf);
+            // RMS: root-mean-square of waveform samples gives signal amplitude (0..1)
+            let sum = 0;
+            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+            const rms = Math.sqrt(sum / buf.length);
+
+            const now = Date.now();
+
+            if (rms >= RMS_SPEECH_ON) {
+                silenceStart = null;
+                hasSpeech    = true;
+                speechChunks++;
+            } else if (rms < RMS_SPEECH_OFF) {
+                if (hasSpeech) {
+                    if (!silenceStart) silenceStart = now;
+                    if (now - silenceStart > SILENCE_DURATION_MS) { submitRecording(); return; }
+                }
+            }
+            // Hard cut-off regardless of speech state
+            if (now - recordingStart > MAX_RECORD_MS) submitRecording();
+        }, 100);
+    }
+
+    function stopRMSVAD() {
+        if (rmsInterval) { clearInterval(rmsInterval); rmsInterval = null; }
+    }
+
+    // startRecording() resets per-turn state and starts the RMS polling.
+    // The MediaRecorder keeps running — only state is reset.
     function startRecording() {
         if (!mediaStream || !isConversationActive) return;
         if (!mediaRecorder || mediaRecorder.state === 'inactive') {
@@ -371,6 +389,7 @@ document.addEventListener("DOMContentLoaded", function() {
         recordingStart = Date.now();
         vadActive      = true;
 
+        startRMSVAD();
         if (vadReady) resetCheckInTimer();
     }
 
@@ -440,6 +459,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
     function stopVAD() {
         vadActive = false;
+        stopRMSVAD();
         if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
     }
 
