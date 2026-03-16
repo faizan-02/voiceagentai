@@ -48,16 +48,20 @@ document.addEventListener("DOMContentLoaded", function() {
     let bookingDetails = { date: null, time: null, services: [] };
 
     // VAD tuning — chunk-size based (opus encodes silence tiny, speech large)
-    const SPEECH_CHUNK_BYTES  = 400;  // bytes/100ms: silence~50-250, speech~400+
     const SILENCE_DURATION_MS = 2000; // ms of sub-threshold chunks before submitting
-    const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech-sized chunks before we consider it real
-    const MAX_RECORD_MS       = 8000; // hard cut-off — submit after 8s regardless
+    const MIN_SPEECH_CHUNKS   = 3;    // 300ms of speech-sized chunks required
+    const MAX_RECORD_MS       = 12000; // hard cut-off — submit after 12s regardless (even if hasSpeech)
     const MIN_AUDIO_BYTES     = 1000; // reject blobs that are clearly empty
     const ECHO_DEAD_ZONE_MS   = 1500; // ms post-AI-speech before VAD activates
-    let silenceStart  = null;
-    let speechChunks  = 0;
-    let hasSpeech     = false;
-    let recordingStart = null;
+    const SPEECH_RATIO        = 2.5;  // chunk must be > 2.5× silence baseline to count as speech
+    let silenceStart    = null;
+    let speechChunks    = 0;
+    let hasSpeech       = false;
+    let recordingStart  = null;
+    // Dynamic silence baseline (exponential moving average).
+    // Only updated during silence (hasSpeech=false) so speech doesn't inflate it.
+    // Adapts per-device, per-codec, per-turn — no fixed threshold needed.
+    let silenceBaseline = 100; // starting estimate in bytes; converges within ~10 chunks
 
     // Populate dropdowns on load
     fetchCharacters();
@@ -316,22 +320,37 @@ document.addEventListener("DOMContentLoaded", function() {
             chunkIndex++;
             if (chunkIndex <= 2) return; // skip first 200ms — WebM container header is oversized
 
-            const now = Date.now();
+            const now  = Date.now();
+            const size = e.data.size;
 
-            // Opus chunk-size VAD:
-            // Silence compresses to ~50-250 bytes/100ms; speech compresses to 400+ bytes.
-            // This works regardless of AudioContext state, mic gain, or browser version.
-            if (e.data.size >= SPEECH_CHUNK_BYTES) {
+            // ── Dynamic EMA baseline ──────────────────────────────────────────────
+            // During silence (hasSpeech=false), update the rolling average of chunk sizes.
+            // This self-calibrates for any codec (Opus, AAC, WebM) and any mic/bitrate.
+            // Speech threshold = 2.5× the silence baseline, floored at 150 bytes.
+            if (!hasSpeech) {
+                silenceBaseline = 0.85 * silenceBaseline + 0.15 * size;
+            }
+            const speechThreshold = Math.max(silenceBaseline * SPEECH_RATIO, 150);
+
+            // ── Chunk-size VAD ────────────────────────────────────────────────────
+            if (size >= speechThreshold) {
                 silenceStart = null;
                 hasSpeech    = true;
                 speechChunks++;
             } else {
                 if (hasSpeech) {
                     if (!silenceStart) silenceStart = now;
-                    if (now - silenceStart > SILENCE_DURATION_MS) submitRecording();
-                } else if (now - recordingStart > MAX_RECORD_MS) {
-                    submitRecording();
+                    if (now - silenceStart > SILENCE_DURATION_MS) {
+                        submitRecording();
+                        return;
+                    }
                 }
+            }
+
+            // Hard cut-off: submit after MAX_RECORD_MS even if still hearing speech.
+            // Prevents getting permanently stuck when background noise fakes hasSpeech=true.
+            if (now - recordingStart > MAX_RECORD_MS) {
+                submitRecording();
             }
         };
 
